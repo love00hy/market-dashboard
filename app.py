@@ -70,7 +70,7 @@ def load_prices(tickers: tuple[str, ...], period: str = "1y") -> dict[str, pd.Da
     for t in tickers:
         try:
             df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
-            df = df.dropna(how="all")
+            df = df.dropna(subset=["Close"])  # 휴장일(다른 종목만 거래된 날) 빈 행 제거
             if not df.empty:
                 df.index = pd.to_datetime(df.index).tz_localize(None)
                 out[t] = df
@@ -218,9 +218,21 @@ def render_headlines(news: pd.DataFrame, show: int = 4):
                 line(n)
 
 
+def render_tone(news: pd.DataFrame):
+    sc = N.tone_score(news)
+    color = UP if sc >= 6 else DOWN if sc <= 4 else NEUTRAL
+    pos, neg = int((news["sentiment"] > 0).sum()), int((news["sentiment"] < 0).sum())
+    st.markdown(
+        f"<div style='display:flex;align-items:center;gap:12px;margin:4px 0 8px'>"
+        f"<span style='font-size:1.6rem;font-weight:700;color:{color}'>{sc:.1f}<small style='font-size:0.9rem'> / 10</small></span>"
+        f"<div style='flex:1'><div style='background:#e0e0e033;border-radius:6px;height:10px'>"
+        f"<div style='width:{sc * 10:.0f}%;background:{color};height:10px;border-radius:6px'></div></div>"
+        f"<small>뉴스 톤 {N.tone_label(sc)} · 긍정 {pos} / 부정 {neg} / 전체 {len(news)}건</small></div></div>",
+        unsafe_allow_html=True)
+
+
 def render_rule_summary(news: pd.DataFrame):
     rs = N.rule_summary(news)
-    st.markdown(f"**뉴스 톤:** {rs['tone']}")
     if rs["themes"]:
         st.markdown(" ".join(f"`{t}`" for t in rs["themes"]))
     for b in rs["bullets"]:
@@ -238,6 +250,11 @@ with st.sidebar:
     st.divider()
     st.subheader("🪙 내 관심 종목")
     ta_ticker = st.text_input("티커 (예: COIN, NVDA, 005930.KS, BTC-USD)", value="COIN").strip().upper() or "COIN"
+    st.markdown("**💼 내 포지션** (차트에 평단선 표시)")
+    pc1, pc2 = st.columns(2)
+    avg_cost = pc1.number_input("평단가", min_value=0.0, value=0.0, step=0.01, format="%.2f",
+                                help="보유하지 않았으면 0")
+    cur_qty = pc2.number_input("보유 수량", min_value=0, value=0, step=1)
     vp_bins = st.slider("매물대 구간 수", 20, 80, 40, step=5)
     swing_order = st.slider("스윙 감도(작을수록 레벨 많음)", 2, 15, 5)
     st.divider()
@@ -498,6 +515,7 @@ with tab_news:
         if news.empty:
             st.info("가져온 뉴스가 없습니다.")
             return
+        render_tone(news)
         if api_key:
             flow_text = f"최근 {f_label} 순유입 {fmt_money(row['순유입'])}, 추세 '{row['등급']}'"
             with st.spinner("AI 요약 중…"):
@@ -543,7 +561,14 @@ with tab_ta:
         st.warning("표시할 봉이 너무 적습니다. 기간을 늘려 주세요.")
         st.stop()
     vp = A.volume_profile(d, bins=vp_bins)
-    sr = A.support_resistance(d, order=swing_order)
+    # 표시 봉 수가 많을수록(예: 일봉 2년) 스윙 감도와 묶음 폭을 키워 '큰 레벨' 위주로
+    scale = max(1.0, len(d) / 126)
+    eff_order = int(round(swing_order * scale))
+    eff_tol = 0.6 * float(np.sqrt(scale))
+    sr = A.support_resistance(d, order=eff_order, tolerance_atr=eff_tol)
+    hi_idx, lo_idx = d["High"].idxmax(), d["Low"].idxmin()
+    p_high, p_low = float(d["High"].max()), float(d["Low"].min())
+    extra_lv = [(p_high, f"기간 고점 ({hi_idx:%Y-%m-%d})", 0), (p_low, f"기간 저점 ({lo_idx:%Y-%m-%d})", 0)]
     hvn = A.high_volume_nodes(vp["levels"])
     last, prev = d.iloc[-1], d.iloc[-2]
     close, atr_v = float(last["Close"]), float(last["ATR"])
@@ -575,6 +600,14 @@ with tab_ta:
         fig.add_hline(y=r["price"], line=dict(color=color, width=1 + min(r["touches"], 4) * 0.5), opacity=0.85,
                       row=1, col=1, annotation_text=f"{r['kind']} {SYM}{r['price']:,.2f} ({r['touches']}회)",
                       annotation_position="bottom right", annotation_font_color=color, annotation_font_size=11)
+    for y, lab, colr, pos in ((p_high, f"기간 고점 {SYM}{p_high:,.2f} ({hi_idx:%y.%m.%d})", "#e040fb", "top left"),
+                              (p_low, f"기간 저점 {SYM}{p_low:,.2f} ({lo_idx:%y.%m.%d})", "#00bcd4", "bottom left")):
+        fig.add_hline(y=y, line=dict(color=colr, width=1.5, dash="dashdot"), row=1, col=1,
+                      annotation_text=lab, annotation_position=pos, annotation_font_color=colr)
+    if avg_cost > 0:
+        fig.add_hline(y=avg_cost, line=dict(color="#2962ff", width=3), row=1, col=1,
+                      annotation_text=f"내 평단 {SYM}{avg_cost:,.2f}" + (f" ({(close / avg_cost - 1) * 100:+.1f}%)"),
+                      annotation_position="top right", annotation_font=dict(color="#2962ff", size=13))
     lv = vp["levels"]
     in_va = (lv["price_mid"] >= vp["val"]) & (lv["price_mid"] <= vp["vah"])
     fig.add_trace(go.Bar(x=lv["volume"], y=lv["price_mid"], orientation="h", name="매물대",
@@ -592,12 +625,13 @@ with tab_ta:
     fig.add_trace(go.Scatter(x=d.index, y=d["macd"], name="MACD", line=dict(color="#29b6f6", width=1.3)), row=3, col=1)
     fig.add_trace(go.Scatter(x=d.index, y=d["signal"], name="Signal", line=dict(color="#ffa726", width=1.3)), row=3, col=1)
     fig.update_layout(height=900, xaxis_rangeslider_visible=False, hovermode="x unified", bargap=0,
-                      legend=dict(orientation="h", y=1.04, x=0), margin=dict(l=10, r=10, t=60, b=10))
+                      legend=dict(orientation="h", y=1.09, x=0), margin=dict(l=10, r=10, t=100, b=10))
     is_crypto = ta_ticker.endswith("-USD")
     if t_iv == "일봉" and not is_crypto:
         for row in (1, 2, 3):
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=row, col=1)
     st.plotly_chart(fig, width="stretch")
+    st.caption(f"지지/저항 자동 감도: 스윙 {eff_order}봉 · 표시 {len(d)}봉 기준 (기간이 길수록 큰 레벨만 남김)")
 
     c1, c2 = st.columns([3, 2])
     with c1:
@@ -615,6 +649,7 @@ with tab_ta:
             if tnews.empty:
                 st.info("가져온 뉴스가 없습니다.")
             else:
+                render_tone(tnews)
                 if api_key:
                     with st.spinner("AI 요약 중…"):
                         st.markdown(ai_cached(N.ticker_prompt(ta_ticker, A.pct_change_over(base["Close"], 21),
@@ -643,10 +678,9 @@ with tab_ta:
     st.caption(f"현재 {t_iv} 차트의 지지·저항선, 매물대(POC/VA), 매물 집중대를 기준으로 가격을 잡습니다. "
                "지지/저항이 부족하면 ATR(평균 변동폭) 간격으로 보충합니다.")
     is_krw = SYM == "₩"
-    i1, i2, i3 = st.columns(3)
-    avg_cost = i1.number_input(f"내 평단가 ({SYM})", min_value=0.0, value=0.0, step=1.0 if is_krw else 0.01,
-                               format="%.0f" if is_krw else "%.2f", help="보유하지 않았으면 0")
-    cur_qty = i2.number_input("보유 수량 (주)", min_value=0, value=0, step=1)
+    i1, i3 = st.columns([2, 1])
+    i1.info(f"💼 내 포지션: 평단 {SYM}{avg_cost:,.2f} × {cur_qty:,}주 — 왼쪽 사이드바에서 수정"
+            if avg_cost > 0 or cur_qty > 0 else "💼 왼쪽 사이드바 '내 포지션'에 평단가와 보유 수량을 넣으면 반영됩니다.")
     budget = i3.number_input(f"추가 매수 예산 ({SYM})", min_value=0.0, value=10_000_000.0 if is_krw else 10_000.0,
                              step=100_000.0 if is_krw else 100.0, format="%.0f")
     j1, j2, j3, j4 = st.columns(4)
@@ -656,19 +690,23 @@ with tab_ta:
     n_sell = j3.number_input("분할매도 횟수", 1, 10, 3)
     sell_mode = j4.selectbox("매도 배분", ["균등", "앞쪽에 많이", "뒤로 갈수록 많이"],
                              help="'앞쪽에 많이' = 가까운 저항에서 먼저 많이 익절")
-    k1, k2 = st.columns(2)
+    k1, k2, k3 = st.columns(3)
     sell_pct = k1.slider("매도할 비중 (%)", 10, 100, 100, step=10)
-    include_buys = k2.checkbox("매도 수량에 '매수 계획 수량'까지 포함", value=True)
+    min_profit = k2.slider("최소 목표 수익률 (평단 대비 %)", 0, 30, 3,
+                           help="1차 매도가가 평단 × (1 + 이 값) 이상이 되도록 그 위의 저항대만 사용")
+    include_buys = k3.checkbox("매도 수량에 '매수 계획 수량'까지 포함", value=False,
+                               help="끄면 지금 보유 수량·평단 기준으로 매도 계획")
 
-    sr_wide = A.support_resistance(d, order=swing_order, max_levels=20)
+    sr_wide = A.support_resistance(d, order=max(2, eff_order // 2), tolerance_atr=eff_tol, max_levels=25)
     hvn_wide = A.high_volume_nodes(vp["levels"], 10)
-    buys, stop = A.plan_buys(close, atr_v, sr_wide, vp, hvn_wide, int(n_buy), budget, buy_mode, cur_qty, avg_cost)
+    buys, stop = A.plan_buys(close, atr_v, sr_wide, vp, hvn_wide, int(n_buy), budget, buy_mode, cur_qty, avg_cost,
+                             extra=extra_lv)
     if include_buys and not buys.empty and buys["누적수량"].iloc[-1] > 0:
         base_qty, base_avg = buys["누적수량"].iloc[-1], buys["매수 후 평단"].iloc[-1]
     else:
         base_qty, base_avg = cur_qty, avg_cost
     sells = A.plan_sells(close, atr_v, sr_wide, vp, hvn_wide, int(n_sell), int(base_qty * sell_pct / 100),
-                         base_avg, sell_mode)
+                         base_avg, sell_mode, min_profit=min_profit, extra=extra_lv)
 
     pfx = SYM
     num = "{:,.0f}" if is_krw else "{:,.2f}"
@@ -684,7 +722,10 @@ with tab_ta:
     with b2:
         st.markdown("##### 🔴 분할매도 계획")
         if sells.empty or sells["수량"].sum() == 0:
-            st.info("매도할 수량이 없습니다. 보유 수량을 입력하거나 '매수 계획 수량 포함'을 켜 주세요.")
+            st.info("매도할 수량이 없습니다. 사이드바에 보유 수량을 입력하거나 '매수 계획 수량 포함'을 켜 주세요.")
+        elif base_avg > 0:
+            st.caption(f"평단 {pfx}{num.format(base_avg)} × (1+{min_profit}%) = "
+                       f"{pfx}{num.format(max(close, base_avg * (1 + min_profit / 100)))} 이상의 저항대에서만 매도가를 잡았습니다.")
         st.dataframe(sells.drop(columns=["기준레벨"]).style.format({
             "매도가": pfx + num, "현재가 대비": "{:+.1f}%", "수량": "{:,.0f}", "금액": pfx + "{:,.0f}",
             "수익률": "{:+.1f}%", "실현손익": lambda v: signed(v, pfx)}, na_rep="-"), hide_index=True, width="stretch")
@@ -694,10 +735,10 @@ with tab_ta:
 
     s1, s2, s3 = st.columns(3)
     s1.metric("손절 참고가", f"{pfx}{num.format(stop)}" if pd.notna(stop) else "-",
-              f"{(stop / close - 1) * 100:+.1f}% (마지막 매수가 −1 ATR)" if pd.notna(stop) else None, delta_color="off")
+              f"{(stop / close - 1) * 100:+.1f}% (마지막 매수 레벨 −ATR, 최대 10%)" if pd.notna(stop) else None, delta_color="off")
     if not buys.empty and buys["누적수량"].iloc[-1] > 0 and pd.notna(stop):
         loss = (stop - buys["매수 후 평단"].iloc[-1]) * buys["누적수량"].iloc[-1]
-        s2.metric("손절 시 예상 손실", signed(loss, pfx))
+        s2.metric("손절 시 예상 손익", signed(loss, pfx))
     if not sells.empty and len(buys):
         avg_buy = (buys["금액"].sum() / buys["수량"].sum()) if buys["수량"].sum() else np.nan
         avg_sell = (sells["금액"].sum() / sells["수량"].sum()) if sells["수량"].sum() else np.nan
@@ -718,8 +759,9 @@ with tab_ta:
                      annotation_text=f"{r['차수']} 매도 {pfx}{num.format(r['매도가'])} ×{r['수량']:,}",
                      annotation_position="top left", annotation_font_color=DOWN)
     if avg_cost > 0:
-        pf.add_hline(y=avg_cost, line=dict(color="#ffffff", dash="dot", width=1.5),
-                     annotation_text=f"현재 평단 {pfx}{num.format(avg_cost)}", annotation_position="top right")
+        pf.add_hline(y=avg_cost, line=dict(color="#2962ff", width=3),
+                     annotation_text=f"내 평단 {pfx}{num.format(avg_cost)}", annotation_position="top right",
+                     annotation_font=dict(color="#2962ff", size=13))
     if pd.notna(stop):
         pf.add_hline(y=stop, line=dict(color="#ff9800", width=2),
                      annotation_text=f"손절 참고 {pfx}{num.format(stop)}", annotation_position="bottom right",
@@ -730,4 +772,4 @@ with tab_ta:
         pf.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     st.plotly_chart(pf, width="stretch")
     st.caption("매수가는 지지선 살짝 위(+0.1 ATR), 매도가는 저항선 살짝 아래(−0.1 ATR)로 잡아 체결 가능성을 높였습니다. "
-               "‘⚠️평단 아래’는 그 가격에 팔면 손실이라는 뜻입니다. 계산 결과는 참고용입니다.")
+               "계산 결과는 참고용입니다.")

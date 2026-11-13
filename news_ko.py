@@ -143,3 +143,25 @@ def market_prompt(rows: list[str], period: str) -> str:
 {body}
 
 한국어로 3~4문장으로 오늘 미국 시장의 섹터 로테이션(어디로 돈이 몰리고 어디서 빠지는지)과 그 이유를 요약하라. 근거 없는 추측은 하지 마라."""
+
+
+def tone_score(news: pd.DataFrame) -> float:
+    """뉴스 톤 점수 0~10 (5 = 중립). 최근 뉴스에 가중치."""
+    if news.empty:
+        return 5.0
+    s = news["sentiment"].astype(float).values
+    w = 0.85 ** pd.Series(range(len(s))).values  # 최신순 정렬 가정, 오래될수록 가중치↓
+    mean = float((s * w).sum() / w.sum())
+    return round(5 + 5 * mean, 1)
+
+
+def tone_label(score: float) -> str:
+    if score >= 7.5:
+        return "😄 매우 긍정"
+    if score >= 6:
+        return "🙂 긍정"
+    if score > 4:
+        return "😐 중립"
+    if score > 2.5:
+        return "🙁 부정"
+    return "😣 매우 부정"

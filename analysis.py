@@ -433,9 +433,10 @@ def flow_trend(df: pd.DataFrame, n: int) -> dict:
 # 9. 분할매수 / 분할매도 계획
 # ─────────────────────────────────────────────
 
-def _level_candidates(close: float, sr: pd.DataFrame, vp: dict, hvn: list[float], side: str) -> list[tuple[float, str, int]]:
+def _level_candidates(close: float, sr: pd.DataFrame, vp: dict, hvn: list[float], side: str,
+                      extra: list[tuple[float, str, int]] | None = None) -> list[tuple[float, str, int]]:
     """(가격, 근거, 우선순위) — 우선순위 작을수록 중요."""
-    c: list[tuple[float, str, int]] = []
+    c: list[tuple[float, str, int]] = list(extra or [])
     for _, r in sr.iterrows():
         c.append((float(r["price"]), f"{'지지' if r['price'] < close else '저항'}선 (터치 {int(r['touches'])}회)", 0))
     c.append((vp["poc"], "POC (최대 매물대)", 1))
@@ -444,21 +445,29 @@ def _level_candidates(close: float, sr: pd.DataFrame, vp: dict, hvn: list[float]
     for p in hvn:
         c.append((p, "매물 집중대", 3))
     if side == "buy":
-        c = [x for x in c if x[0] < close * 0.997]
+        c = [x for x in c if x[0] < close]
         c.sort(key=lambda x: -x[0])
     else:
-        c = [x for x in c if x[0] > close * 1.003]
+        c = [x for x in c if x[0] > close]
         c.sort(key=lambda x: x[0])
     return c
 
 
-def _pick_levels(cands, n: int, atr_v: float, close: float, side: str) -> list[tuple[float, str]]:
+def _pick_levels(cands, n: int, atr_v: float, ref: float, side: str) -> list[tuple[float, str]]:
+    """
+    ref 기준(매수: 현재가 아래 / 매도: max(현재가, 평단) 위)으로 n개 레벨 선택.
+    간격 기준은 ATR과 가격의 %를 함께 써서 월봉처럼 ATR이 큰 경우에도 레벨이 뭉개지지 않게 함.
+    """
+    near = min(0.3 * atr_v, 0.015 * ref)
+    if side == "buy":
+        cands = [x for x in cands if x[0] <= ref - near]
+    else:
+        cands = [x for x in cands if x[0] >= ref + near]
     picked: list[tuple[float, str, int]] = []
-    # 현재가에 너무 붙은 레벨(0.3 ATR 이내)은 제외
-    cands = [x for x in cands if abs(x[0] - close) >= 0.3 * atr_v]
     for p, label, pr in cands:
-        clash = [i for i, q in enumerate(picked) if abs(q[0] - p) < 0.5 * atr_v]
-        if clash:  # 너무 가까운 레벨은 하나로 (더 중요한 근거를 유지, 근거는 합침)
+        gap = min(0.5 * atr_v, 0.03 * p)
+        clash = [i for i, q in enumerate(picked) if abs(q[0] - p) < gap]
+        if clash:  # 너무 가까운 레벨은 하나로 (더 중요한 근거 유지, 근거는 합침)
             i = clash[0]
             q = picked[i]
             if pr < q[2]:
@@ -470,15 +479,14 @@ def _pick_levels(cands, n: int, atr_v: float, close: float, side: str) -> list[t
         if len(picked) >= n:
             break
     levels = [(p, l) for p, l, _ in picked]
-    # 레벨이 부족하면 ATR 간격으로 보충
-    sign = -1 if side == "buy" else 1
-    base = levels[-1][0] if levels else close
+    # 레벨이 부족하면 변동폭 간격(ATR%, 최대 매수 12% / 매도 20%)으로 보충
+    step = min(atr_v / ref, 0.12 if side == "buy" else 0.20)
+    step = max(step, 0.03)
+    last = levels[-1][0] if levels else ref
     k = 1
     while len(levels) < n:
-        p = base + sign * k * atr_v
-        if p <= 0:
-            break
-        levels.append((p, f"ATR 보조 레벨 ({'지지' if side == 'buy' else '저항'} 부재, {k}×ATR)"))
+        last = last * (1 - step) if side == "buy" else last * (1 + step)
+        levels.append((last, f"보조 레벨 ({'지지' if side == 'buy' else '저항'} 부재, {step * 100:.0f}% 간격)"))
         k += 1
     return levels[:n]
 
@@ -494,12 +502,13 @@ def _weights(n: int, mode: str) -> np.ndarray:
 
 
 def plan_buys(close: float, atr_v: float, sr, vp, hvn, n: int, budget: float,
-              mode: str = "균등", cur_qty: float = 0, avg_cost: float = 0) -> tuple[pd.DataFrame, float]:
-    levels = _pick_levels(_level_candidates(close, sr, vp, hvn, "buy"), n, atr_v, close, "buy")
+              mode: str = "균등", cur_qty: float = 0, avg_cost: float = 0,
+              extra=None) -> tuple[pd.DataFrame, float]:
+    levels = _pick_levels(_level_candidates(close, sr, vp, hvn, "buy", extra), n, atr_v, close, "buy")
     w = _weights(len(levels), mode)
     rows, qty, cost = [], float(cur_qty), float(cur_qty) * float(avg_cost)
     for i, ((lvl, why), wi) in enumerate(zip(levels, w), 1):
-        price = min(lvl + 0.1 * atr_v, close)  # 지지선 살짝 위에 지정가 (체결 확률↑)
+        price = min(lvl + min(0.1 * atr_v, 0.005 * lvl), close)  # 지지선 살짝 위 지정가
         q = int(budget * wi // price) if price > 0 else 0
         qty += q
         cost += q * price
@@ -507,23 +516,31 @@ def plan_buys(close: float, atr_v: float, sr, vp, hvn, n: int, budget: float,
                      "현재가 대비": (price / close - 1) * 100, "수량": q, "금액": q * price,
                      "누적수량": qty, "매수 후 평단": cost / qty if qty else np.nan})
     df = pd.DataFrame(rows)
-    stop = (levels[-1][0] - 1.0 * atr_v) if levels else np.nan
+    # 손절 참고: 마지막 매수 레벨 아래로 ATR(최대 10%)만큼
+    stop = levels[-1][0] * (1 - min(atr_v / levels[-1][0], 0.10)) if levels else np.nan
     return df, stop
 
 
 def plan_sells(close: float, atr_v: float, sr, vp, hvn, m: int, total_qty: float,
-               avg_cost: float, mode: str = "균등") -> pd.DataFrame:
-    levels = _pick_levels(_level_candidates(close, sr, vp, hvn, "sell"), m, atr_v, close, "sell")
+               avg_cost: float, mode: str = "균등", min_profit: float = 2.0, extra=None) -> pd.DataFrame:
+    """
+    매도 레벨은 '현재가'와 '평단 × (1 + 최소수익%)' 중 높은 가격 위의 저항대에서만 고른다
+    → 손해 보는 매도가는 나오지 않음.
+    """
+    floor = close
+    if avg_cost > 0:
+        floor = max(close, avg_cost * (1 + min_profit / 100))
+    cands = _level_candidates(floor, sr, vp, hvn, "sell", extra)
+    levels = _pick_levels(cands, m, atr_v, floor, "sell")
     w = _weights(len(levels), mode)
     qtys = np.floor(total_qty * w).astype(int)
     if len(qtys):
         qtys[-1] += int(total_qty) - qtys.sum()  # 나머지는 마지막 차수에
     rows = []
     for i, ((lvl, why), q) in enumerate(zip(levels, qtys), 1):
-        price = lvl - 0.1 * atr_v  # 저항선 살짝 아래 지정가
+        price = max(lvl - min(0.1 * atr_v, 0.005 * lvl), floor)  # 저항선 살짝 아래, 단 floor 이상
         pnl = (price - avg_cost) * q if avg_cost > 0 else np.nan
-        rows.append({"차수": f"{i}차", "근거": why + (" ⚠️평단 아래" if avg_cost > 0 and price < avg_cost else ""),
-                     "기준레벨": lvl, "매도가": price, "현재가 대비": (price / close - 1) * 100,
-                     "수량": int(q), "금액": q * price,
+        rows.append({"차수": f"{i}차", "근거": why, "기준레벨": lvl, "매도가": price,
+                     "현재가 대비": (price / close - 1) * 100, "수량": int(q), "금액": q * price,
                      "수익률": (price / avg_cost - 1) * 100 if avg_cost > 0 else np.nan, "실현손익": pnl})
     return pd.DataFrame(rows)
