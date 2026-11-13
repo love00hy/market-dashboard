@@ -270,7 +270,8 @@ with st.sidebar:
     st.caption("데이터는 10분간 캐시됩니다.")
     st.divider()
     st.subheader("🪙 내 관심 종목")
-    ta_ticker = st.text_input("티커 (예: COIN, NVDA, 005930.KS, BTC-USD)", value="COIN").strip().upper() or "COIN"
+    ta_ticker = st.text_input("티커 (예: COIN, NVDA, 005930.KS, BTC-USD)", value="",
+                              placeholder="티커를 입력하세요").strip().upper()
     st.markdown("**💼 내 포지션** (차트에 평단선 표시)")
     pc1, pc2 = st.columns(2)
     avg_cost = pc1.number_input("평단가", min_value=0.0, value=0.0, step=0.01, format="%.2f",
@@ -293,14 +294,14 @@ st.title("📈 마켓 대시보드")
 st.caption(f"Yahoo Finance 기준 (약 15분 지연) · 조회 시각 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 tab_idx, tab_sec, tab_news, tab_ta = st.tabs(
-    ["📊 주요 지수", "🏭 섹터 & 자금흐름", "📰 강세·약세 이유(뉴스)", f"🪙 {ta_ticker} 기술적 분석"])
+    ["📊 주요 지수", "🏭 섹터 & 자금흐름", "📰 강세·약세 이유(뉴스)", f"🪙 {ta_ticker or '종목'} 기술적 분석"])
 
 # ═════════════════════════════════════════════
 # 1) 주요 지수
 # ═════════════════════════════════════════════
 with tab_idx:
     with st.spinner("지수 데이터 불러오는 중…"):
-        idx_data = load_prices(tuple(INDICES) + (ta_ticker,), "10y")
+        idx_data = load_prices(tuple(INDICES) + ((ta_ticker,) if ta_ticker else ()), "10y")
 
     _pos_df = idx_data.get(ta_ticker)
     if _pos_df is not None and avg_cost > 0 and cur_qty > 0:
@@ -336,7 +337,7 @@ with tab_idx:
     with c1:
         series = {}
         for t, label in ((sel, INDICES[sel]), (ta_ticker, ta_ticker)):
-            if t in idx_data:
+            if t and t in idx_data:
                 series[label] = slice_months(A.resample_ohlc(idx_data[t], iv), months)["Close"]
         fig = go.Figure()
         if series:
@@ -350,7 +351,7 @@ with tab_idx:
                 fig.add_trace(go.Bar(x=gap.index, y=gap, name=f"{ta_ticker} 초과수익(%p)", opacity=0.25,
                                      marker_color=np.where(gap >= 0, UP, DOWN)))
         fig.add_hline(y=0, line_dash="dot", line_color=NEUTRAL)
-        fig.update_layout(title=f"{ta_ticker} vs {INDICES[sel]} 수익률 비교 ({iv} · {rng})", height=460,
+        fig.update_layout(title=(f"{ta_ticker} vs {INDICES[sel]}" if ta_ticker else INDICES[sel]) + f" 수익률 ({iv} · {rng})", height=460,
                           hovermode="x unified", yaxis_ticksuffix="%", bargap=0,
                           margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.12))
         st.plotly_chart(fig, width="stretch")
@@ -365,6 +366,8 @@ with tab_idx:
             m[2].metric("초과수익", f"{norm.iloc[-1, 1] - norm.iloc[-1, 0]:+.2f}%p")
             m[3].metric("상관계수 / 베타", f"{corr:.2f} / {beta:.2f}")
             st.caption("베타 1.5 = 지수가 1% 움직일 때 평균 1.5% 움직임 · 상관계수 1에 가까울수록 지수와 같이 움직임")
+        elif not ta_ticker:
+            st.info("👈 사이드바에 관심 종목 티커를 입력하면 지수와 수익률을 비교해 드립니다.")
         elif ta_ticker not in idx_data:
             st.warning(f"'{ta_ticker}' 데이터를 찾지 못했습니다. 사이드바 티커를 확인해 주세요.")
 
@@ -576,6 +579,10 @@ with tab_news:
 # 4) 기술적 분석
 # ═════════════════════════════════════════════
 with tab_ta:
+    if not ta_ticker:
+        st.info("👈 왼쪽 사이드바 **'내 관심 종목'**에 티커를 입력하면 기술적 분석, 주요 이슈, "
+                "분할매수·매도 계산기가 표시됩니다.\n\n예: `COIN`, `NVDA`, `TSLA`, `005930.KS`(삼성전자), `BTC-USD`(비트코인)")
+        st.stop()
     base = idx_data.get(ta_ticker)
     if base is None or len(base) < 60:
         st.error(f"'{ta_ticker}' 데이터를 가져오지 못했습니다. 티커를 확인해 주세요. (한국 주식은 005930.KS 형식)")
