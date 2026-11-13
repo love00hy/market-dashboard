@@ -218,8 +218,29 @@ def render_headlines(news: pd.DataFrame, show: int = 4):
                 line(n)
 
 
+def tone_score(news: pd.DataFrame) -> float:
+    """뉴스 톤 점수 0~10 (5 = 중립). 최신 뉴스일수록 가중치↑."""
+    if news.empty:
+        return 5.0
+    s = news["sentiment"].astype(float).values
+    w = 0.85 ** np.arange(len(s))
+    return round(5 + 5 * float((s * w).sum() / w.sum()), 1)
+
+
+def tone_label(score: float) -> str:
+    if score >= 7.5:
+        return "😄 매우 긍정"
+    if score >= 6:
+        return "🙂 긍정"
+    if score > 4:
+        return "😐 중립"
+    if score > 2.5:
+        return "🙁 부정"
+    return "😣 매우 부정"
+
+
 def render_tone(news: pd.DataFrame):
-    sc = N.tone_score(news)
+    sc = tone_score(news)
     color = UP if sc >= 6 else DOWN if sc <= 4 else NEUTRAL
     pos, neg = int((news["sentiment"] > 0).sum()), int((news["sentiment"] < 0).sum())
     st.markdown(
@@ -227,7 +248,7 @@ def render_tone(news: pd.DataFrame):
         f"<span style='font-size:1.6rem;font-weight:700;color:{color}'>{sc:.1f}<small style='font-size:0.9rem'> / 10</small></span>"
         f"<div style='flex:1'><div style='background:#e0e0e033;border-radius:6px;height:10px'>"
         f"<div style='width:{sc * 10:.0f}%;background:{color};height:10px;border-radius:6px'></div></div>"
-        f"<small>뉴스 톤 {N.tone_label(sc)} · 긍정 {pos} / 부정 {neg} / 전체 {len(news)}건</small></div></div>",
+        f"<small>뉴스 톤 {tone_label(sc)} · 긍정 {pos} / 부정 {neg} / 전체 {len(news)}건</small></div></div>",
         unsafe_allow_html=True)
 
 
@@ -565,10 +586,10 @@ with tab_ta:
     scale = max(1.0, len(d) / 126)
     eff_order = int(round(swing_order * scale))
     eff_tol = 0.6 * float(np.sqrt(scale))
-    sr = A.support_resistance(d, order=eff_order, tolerance_atr=eff_tol)
+    sr = A.support_resistance(d, order=eff_order, tolerance_atr=eff_tol, max_levels=8, min_gap_atr=1.0)
     hi_idx, lo_idx = d["High"].idxmax(), d["Low"].idxmin()
     p_high, p_low = float(d["High"].max()), float(d["Low"].min())
-    extra_lv = [(p_high, f"기간 고점 ({hi_idx:%Y-%m-%d})", 0), (p_low, f"기간 저점 ({lo_idx:%Y-%m-%d})", 0)]
+    extra_lv = [(p_high, f"기간 고점 ({hi_idx:%Y-%m-%d})", 6.0), (p_low, f"기간 저점 ({lo_idx:%Y-%m-%d})", 6.0)]
     hvn = A.high_volume_nodes(vp["levels"])
     last, prev = d.iloc[-1], d.iloc[-2]
     close, atr_v = float(last["Close"]), float(last["ATR"])
@@ -631,7 +652,8 @@ with tab_ta:
         for row in (1, 2, 3):
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=row, col=1)
     st.plotly_chart(fig, width="stretch")
-    st.caption(f"지지/저항 자동 감도: 스윙 {eff_order}봉 · 표시 {len(d)}봉 기준 (기간이 길수록 큰 레벨만 남김)")
+    st.caption(f"지지/저항 자동 감도: 스윙 {eff_order}봉 · 표시 {len(d)}봉 기준 — 크게 솟은 고점·저점과 여러 번 닿은 가격 위주로, "
+               "서로 4% 이상 떨어진 큰 레벨만 표시합니다.")
 
     c1, c2 = st.columns([3, 2])
     with c1:
@@ -690,6 +712,22 @@ with tab_ta:
     n_sell = j3.number_input("분할매도 횟수", 1, 10, 3)
     sell_mode = j4.selectbox("매도 배분", ["균등", "앞쪽에 많이", "뒤로 갈수록 많이"],
                              help="'앞쪽에 많이' = 가까운 저항에서 먼저 많이 익절")
+    t1, t2 = st.columns(2)
+    target_px = t1.number_input(f"🎯 최종 목표가 ({SYM}, 0 = 자동)", min_value=0.0, value=0.0,
+                                step=1.0 if is_krw else 1.0, format="%.0f" if is_krw else "%.2f",
+                                help="입력하면 마지막 차수를 이 가격에 두고, 그 사이 큰 저항대에 나머지 차수를 배치합니다.")
+    custom_txt = t2.text_input("차수별 매도 비중 직접 입력 (%, 선택)", value="",
+                               placeholder="예: 15,15,20,20,30  (분할매도 횟수만큼, 비우면 '매도 배분' 사용)")
+    custom_pct = None
+    if custom_txt.strip():
+        try:
+            custom_pct = [float(x) for x in custom_txt.replace(" ", "").split(",") if x]
+            if len(custom_pct) != int(n_sell):
+                t2.warning(f"분할매도 횟수({int(n_sell)}회)와 개수가 달라 '매도 배분' 방식을 사용합니다.")
+                custom_pct = None
+        except ValueError:
+            t2.warning("숫자와 쉼표만 입력해 주세요.")
+            custom_pct = None
     k1, k2, k3 = st.columns(3)
     sell_pct = k1.slider("매도할 비중 (%)", 10, 100, 100, step=10)
     min_profit = k2.slider("최소 목표 수익률 (평단 대비 %)", 0, 30, 3,
@@ -697,7 +735,7 @@ with tab_ta:
     include_buys = k3.checkbox("매도 수량에 '매수 계획 수량'까지 포함", value=False,
                                help="끄면 지금 보유 수량·평단 기준으로 매도 계획")
 
-    sr_wide = A.support_resistance(d, order=max(2, eff_order // 2), tolerance_atr=eff_tol, max_levels=25)
+    sr_wide = A.support_resistance(d, order=max(2, eff_order // 2), tolerance_atr=eff_tol, max_levels=0)
     hvn_wide = A.high_volume_nodes(vp["levels"], 10)
     buys, stop = A.plan_buys(close, atr_v, sr_wide, vp, hvn_wide, int(n_buy), budget, buy_mode, cur_qty, avg_cost,
                              extra=extra_lv)
@@ -706,7 +744,8 @@ with tab_ta:
     else:
         base_qty, base_avg = cur_qty, avg_cost
     sells = A.plan_sells(close, atr_v, sr_wide, vp, hvn_wide, int(n_sell), int(base_qty * sell_pct / 100),
-                         base_avg, sell_mode, min_profit=min_profit, extra=extra_lv)
+                         base_avg, sell_mode, min_profit=min_profit, extra=extra_lv,
+                         target=target_px or None, custom_pct=custom_pct)
 
     pfx = SYM
     num = "{:,.0f}" if is_krw else "{:,.2f}"
@@ -723,11 +762,13 @@ with tab_ta:
         st.markdown("##### 🔴 분할매도 계획")
         if sells.empty or sells["수량"].sum() == 0:
             st.info("매도할 수량이 없습니다. 사이드바에 보유 수량을 입력하거나 '매수 계획 수량 포함'을 켜 주세요.")
-        elif base_avg > 0:
+        if target_px and target_px <= max(close, base_avg * (1 + min_profit / 100)):
+            st.warning("최종 목표가가 현재가/최소 목표가보다 낮아서 자동 모드로 계산했습니다.")
+        if base_avg > 0 and not sells.empty:
             st.caption(f"평단 {pfx}{num.format(base_avg)} × (1+{min_profit}%) = "
                        f"{pfx}{num.format(max(close, base_avg * (1 + min_profit / 100)))} 이상의 저항대에서만 매도가를 잡았습니다.")
         st.dataframe(sells.drop(columns=["기준레벨"]).style.format({
-            "매도가": pfx + num, "현재가 대비": "{:+.1f}%", "수량": "{:,.0f}", "금액": pfx + "{:,.0f}",
+            "매도가": pfx + num, "현재가 대비": "{:+.1f}%", "비중": "{:.0f}%", "수량": "{:,.0f}", "금액": pfx + "{:,.0f}",
             "수익률": "{:+.1f}%", "실현손익": lambda v: signed(v, pfx)}, na_rep="-"), hide_index=True, width="stretch")
         if not sells.empty and sells["실현손익"].notna().any():
             st.caption(f"전량 체결 시 예상 실현손익 {signed(sells['실현손익'].sum(), pfx)} "
