@@ -302,6 +302,19 @@ with tab_idx:
     with st.spinner("지수 데이터 불러오는 중…"):
         idx_data = load_prices(tuple(INDICES) + (ta_ticker,), "10y")
 
+    _pos_df = idx_data.get(ta_ticker)
+    if _pos_df is not None and avg_cost > 0 and cur_qty > 0:
+        _px = float(_pos_df["Close"].iloc[-1])
+        _pl = (_px - avg_cost) * cur_qty
+        _pr = (_px / avg_cost - 1) * 100
+        _c = UP if _pl >= 0 else DOWN
+        st.sidebar.markdown(
+            f"<div style='border:1px solid {_c};border-radius:8px;padding:8px 10px;margin-top:-6px'>"
+            f"<small>{ta_ticker} 종가 {SYM}{_px:,.2f} 기준</small><br>"
+            f"<b style='color:{_c};font-size:1.25rem'>{'+' if _pl >= 0 else '-'}{SYM}{abs(_pl):,.0f} ({_pr:+.2f}%)</b><br>"
+            f"<small>평가금액 {SYM}{_px * cur_qty:,.0f} · 매입금액 {SYM}{avg_cost * cur_qty:,.0f}</small></div>",
+            unsafe_allow_html=True)
+
     cols = st.columns(len(INDICES))
     for col, (t, name) in zip(cols, INDICES.items()):
         df = idx_data.get(t)
@@ -602,6 +615,15 @@ with tab_ta:
     m[4].metric("POC(최대 매물대)", f"{SYM}{vp['poc']:,.2f}",
                 f"현재가 대비 {(close / vp['poc'] - 1) * 100:+.1f}%", delta_color="off")
 
+    if avg_cost > 0 and cur_qty > 0:
+        pl = (close - avg_cost) * cur_qty
+        pm = st.columns(4)
+        pm[0].metric("💼 내 평단", f"{SYM}{avg_cost:,.2f}", f"{cur_qty:,}주 보유", delta_color="off")
+        pm[1].metric("평가금액", f"{SYM}{close * cur_qty:,.0f}", f"매입 {SYM}{avg_cost * cur_qty:,.0f}", delta_color="off")
+        pm[2].metric("평가손익", signed(pl, SYM), f"{(close / avg_cost - 1) * 100:+.2f}%")
+        pm[3].metric("본전까지", f"{(avg_cost / close - 1) * 100:+.2f}%" if close < avg_cost else "수익 구간",
+                     f"현재가 {SYM}{close:,.2f}", delta_color="off")
+
     fig = make_subplots(
         rows=3, cols=2, shared_xaxes=True, column_widths=[0.82, 0.18], row_heights=[0.62, 0.18, 0.20],
         horizontal_spacing=0.005, vertical_spacing=0.03,
@@ -705,6 +727,10 @@ with tab_ta:
             if avg_cost > 0 or cur_qty > 0 else "💼 왼쪽 사이드바 '내 포지션'에 평단가와 보유 수량을 넣으면 반영됩니다.")
     budget = i3.number_input(f"추가 매수 예산 ({SYM})", min_value=0.0, value=10_000_000.0 if is_krw else 10_000.0,
                              step=100_000.0 if is_krw else 100.0, format="%.0f")
+    q1, q2 = st.columns(2)
+    below_avg = q1.checkbox("평단 아래에서만 분할매수 (물타기)", value=True,
+                            help="보유 중이면 '현재가'와 '내 평단' 중 낮은 가격 아래의 지지선에서만 매수합니다. 끄면 현재가 아래 지지선 기준(불타기 포함).")
+    min_disc = q2.slider("1차 매수는 평단보다 최소 몇 % 아래", 0, 30, 0, disabled=not below_avg)
     j1, j2, j3, j4 = st.columns(4)
     n_buy = j1.number_input("분할매수 횟수", 1, 10, 5)
     buy_mode = j2.selectbox("매수 배분", ["균등", "뒤로 갈수록 많이", "앞쪽에 많이"],
@@ -738,7 +764,7 @@ with tab_ta:
     sr_wide = A.support_resistance(d, order=max(2, eff_order // 2), tolerance_atr=eff_tol, max_levels=0)
     hvn_wide = A.high_volume_nodes(vp["levels"], 10)
     buys, stop = A.plan_buys(close, atr_v, sr_wide, vp, hvn_wide, int(n_buy), budget, buy_mode, cur_qty, avg_cost,
-                             extra=extra_lv)
+                             extra=extra_lv, below_avg=below_avg, min_discount=min_disc)
     if include_buys and not buys.empty and buys["누적수량"].iloc[-1] > 0:
         base_qty, base_avg = buys["누적수량"].iloc[-1], buys["매수 후 평단"].iloc[-1]
     else:
@@ -753,7 +779,7 @@ with tab_ta:
     with b1:
         st.markdown("##### 🟢 분할매수 계획")
         st.dataframe(buys.drop(columns=["기준레벨"]).style.format({
-            "매수가": pfx + num, "현재가 대비": "{:+.1f}%", "수량": "{:,.0f}", "금액": pfx + "{:,.0f}",
+            "매수가": pfx + num, "현재가 대비": "{:+.1f}%", "평단 대비": "{:+.1f}%", "수량": "{:,.0f}", "금액": pfx + "{:,.0f}",
             "누적수량": "{:,.0f}", "매수 후 평단": pfx + num}, na_rep="-"), hide_index=True, width="stretch")
         spent = buys["금액"].sum() if not buys.empty else 0
         st.caption(f"총 매수금액 {pfx}{spent:,.0f} / 예산 {pfx}{budget:,.0f} · "

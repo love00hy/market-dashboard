@@ -569,17 +569,26 @@ def _weights(n: int, mode: str) -> np.ndarray:
 
 def plan_buys(close: float, atr_v: float, sr, vp, hvn, n: int, budget: float,
               mode: str = "균등", cur_qty: float = 0, avg_cost: float = 0,
-              extra=None) -> tuple[pd.DataFrame, float]:
-    levels = _pick_levels(_level_candidates(close, sr, vp, hvn, "buy", extra), n, atr_v, close, "buy")
+              extra=None, below_avg: bool = True, min_discount: float = 0.0) -> tuple[pd.DataFrame, float]:
+    """
+    below_avg=True 이고 보유 중이면, 매수 기준가 = min(현재가, 평단 × (1 − min_discount%))
+    → 평단 아래 지지선에서만 물타기.
+    """
+    ref = close
+    if below_avg and avg_cost > 0 and cur_qty > 0:
+        ref = min(close, avg_cost * (1 - min_discount / 100))
+    levels = _pick_levels(_level_candidates(ref, sr, vp, hvn, "buy", extra), n, atr_v, ref, "buy")
     w = _weights(len(levels), mode)
     rows, qty, cost = [], float(cur_qty), float(cur_qty) * float(avg_cost)
     for i, ((lvl, why), wi) in enumerate(zip(levels, w), 1):
-        price = min(lvl + min(0.1 * atr_v, 0.005 * lvl), close)  # 지지선 살짝 위 지정가
+        price = min(lvl + min(0.1 * atr_v, 0.005 * lvl), ref)  # 지지선 살짝 위 지정가 (기준가 이하)
         q = int(budget * wi // price) if price > 0 else 0
         qty += q
         cost += q * price
         rows.append({"차수": f"{i}차", "근거": why, "기준레벨": lvl, "매수가": price,
-                     "현재가 대비": (price / close - 1) * 100, "수량": q, "금액": q * price,
+                     "현재가 대비": (price / close - 1) * 100,
+                     "평단 대비": (price / avg_cost - 1) * 100 if avg_cost > 0 else np.nan,
+                     "수량": q, "금액": q * price,
                      "누적수량": qty, "매수 후 평단": cost / qty if qty else np.nan})
     df = pd.DataFrame(rows)
     # 손절 참고: 마지막 매수 레벨 아래로 ATR(최대 10%)만큼
