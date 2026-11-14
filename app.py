@@ -15,6 +15,8 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 import analysis as A
+import analysts as AN
+import gurus as G
 import news_ko as N
 
 st.set_page_config(page_title="마켓 대시보드", page_icon="📈", layout="wide")
@@ -31,23 +33,6 @@ INDICES = {
     "^VIX": "VIX(공포지수)",
 }
 
-# 섹터 ETF : (한글명, 뉴스 수집용 대표 보유종목)
-SECTORS = {
-    "XLK": ("기술", ["NVDA", "AAPL", "MSFT"]),
-    "XLC": ("커뮤니케이션", ["META", "GOOGL", "NFLX"]),
-    "XLY": ("경기소비재", ["AMZN", "TSLA", "HD"]),
-    "XLF": ("금융", ["JPM", "V", "BRK-B"]),
-    "XLV": ("헬스케어", ["LLY", "UNH", "JNJ"]),
-    "XLI": ("산업재", ["GE", "CAT", "RTX"]),
-    "XLE": ("에너지", ["XOM", "CVX", "COP"]),
-    "XLP": ("필수소비재", ["COST", "WMT", "PG"]),
-    "XLU": ("유틸리티", ["NEE", "SO", "DUK"]),
-    "XLB": ("소재", ["LIN", "SHW", "FCX"]),
-    "XLRE": ("부동산", ["PLD", "AMT", "EQIX"]),
-}
-
-PERIODS = {"1일": 1, "1주": 5, "1개월": 21, "3개월": 63, "연초 대비": "YTD"}
-FLOW_WINDOWS = {"5일": 5, "10일": 10, "20일": 20, "60일": 60}
 # 봉 주기별 표시 기간(개월)
 RANGES = {
     "일봉": {"1개월": 1, "3개월": 3, "6개월": 6, "1년": 12, "2년": 24},
@@ -280,11 +265,11 @@ with st.sidebar:
     vp_bins = st.slider("매물대 구간 수", 20, 80, 40, step=5)
     swing_order = st.slider("스윙 감도(작을수록 레벨 많음)", 2, 15, 5)
     st.divider()
-    st.subheader("🤖 AI 뉴스 요약 (선택)")
+    st.subheader("🤖 AI 해설 (선택)")
     api_key = get_secret("ANTHROPIC_API_KEY") or st.text_input(
-        "Claude API 키", type="password", help="입력하면 뉴스를 한국어로 원인 분석·요약합니다. 없으면 번역+키워드 요약만 제공.")
+        "Claude API 키", type="password", help="입력하면 거장 매매·애널리스트 의견·종목 이슈를 AI가 한국어로 해설합니다. 없어도 자동 요약은 제공.")
     ai_model = get_secret("ANTHROPIC_MODEL", "claude-haiku-5-5")
-    st.caption("✅ AI 요약 켜짐" if api_key else "번역 + 키워드 요약 모드")
+    st.caption("✅ AI 해설 켜짐" if api_key else "자동 요약 모드 (AI 해설 꺼짐)")
     st.divider()
     st.caption("⚠️ 투자 참고용입니다. 투자 판단과 책임은 본인에게 있습니다.")
 
@@ -293,8 +278,9 @@ SYM = sym_of(ta_ticker)
 st.title("📈 마켓 대시보드")
 st.caption(f"Yahoo Finance 기준 (약 15분 지연) · 조회 시각 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-tab_idx, tab_sec, tab_news, tab_ta = st.tabs(
-    ["📊 주요 지수", "🏭 섹터 & 자금흐름", "📰 강세·약세 이유(뉴스)", f"🪙 {ta_ticker or '종목'} 기술적 분석"])
+tab_idx, tab_guru, tab_overlap, tab_analyst, tab_ta = st.tabs(
+    ["📊 주요 지수", "🏛️ 거장 포트폴리오", "🔁 거장 중복 종목", "📑 애널리스트 강세·약세",
+     f"🪙 {ta_ticker or '종목'} 기술적 분석"])
 
 # ═════════════════════════════════════════════
 # 1) 주요 지수
@@ -388,192 +374,398 @@ with tab_idx:
             st.plotly_chart(f2, width="stretch")
 
 # ═════════════════════════════════════════════
-# 2) 섹터 & 자금흐름
+# 2) 거장 포트폴리오 (SEC 13F)
 # ═════════════════════════════════════════════
-with st.spinner("섹터 데이터 불러오는 중…"):
-    sec_data = load_prices(tuple(SECTORS), "2y")
+SEC_UA = get_secret("SEC_USER_AGENT", "MarketDashboard personal-research contact@marketdashboard.app")
+FIGI_KEY = get_secret("OPENFIGI_API_KEY", "")
+STATUS_ICON = {"신규": "🆕 신규", "증가": "🟢 증가", "유지": "⚪ 유지", "감소": "🟠 감소", "청산": "🔴 청산"}
+STATUS_COLOR = {"신규": "#00c853", "증가": UP, "유지": "#90a4ae", "감소": "#ffa726", "청산": DOWN}
 
 
-def sector_table(period_key, flow_n: int) -> pd.DataFrame:
-    rows = []
-    for t, (name, _) in SECTORS.items():
-        df = sec_data.get(t)
-        if df is None:
-            continue
-        ft = A.flow_trend(df, flow_n)
-        rows.append({"티커": t, "섹터": name, "선택기간": period_change(df, period_key),
-                     "순유입": ft.get("net_usd", np.nan), "유입강도": ft.get("intensity", np.nan),
-                     "직전강도": ft.get("prev", np.nan), "증가율": ft.get("change_pp", np.nan),
-                     "기간수익률": ft.get("ret", np.nan), "ADX": ft.get("adx", np.nan),
-                     "추세점수": ft.get("score", np.nan), "등급": ft.get("grade", "-"),
-                     "코멘트": ft.get("comment", "")})
-    return pd.DataFrame(rows).sort_values("선택기간", ascending=False).reset_index(drop=True)
+@st.cache_resource
+def _http():
+    import requests
+    return requests.Session()
 
 
-with tab_sec:
-    cc = st.columns(2)
-    p_label = cc[0].radio("등락률 기간", list(PERIODS), index=1, horizontal=True, key="sec_p")
-    f_label = cc[1].radio("자금흐름 기간", list(FLOW_WINDOWS), index=2, horizontal=True, key="sec_f")
-    st.session_state["sector_period"] = p_label
-    st.session_state["flow_window"] = f_label
-    fn = FLOW_WINDOWS[f_label]
-    tbl = sector_table(PERIODS[p_label], fn)
+@st.cache_resource
+def _figi_store() -> dict:
+    return {}
 
-    c1, c2 = st.columns(2)
-    with c1:
-        t_sorted = tbl.sort_values("선택기간")
-        fig = go.Figure(go.Bar(
-            x=t_sorted["선택기간"], y=t_sorted["섹터"] + " (" + t_sorted["티커"] + ")", orientation="h",
-            marker_color=[UP if v >= 0 else DOWN for v in t_sorted["선택기간"]],
-            text=[f"{v:+.2f}%" for v in t_sorted["선택기간"]], textposition="outside"))
-        fig.update_layout(title=f"섹터별 등락률 ({p_label})", height=440, xaxis_ticksuffix="%",
-                          margin=dict(l=10, r=40, t=50, b=10))
-        st.plotly_chart(fig, width="stretch")
-    with c2:
-        f_sorted = tbl.sort_values("순유입")
-        fig = go.Figure(go.Bar(
-            x=f_sorted["순유입"] / 1e6, y=f_sorted["섹터"], orientation="h",
-            marker_color=[UP if v >= 0 else DOWN for v in f_sorted["순유입"]],
-            text=[fmt_money(v) for v in f_sorted["순유입"]], textposition="outside"))
-        fig.update_layout(title=f"순자금 유입 추정 (최근 {f_label}, $M)", height=440,
-                          margin=dict(l=10, r=40, t=50, b=10))
-        st.plotly_chart(fig, width="stretch")
 
-    st.subheader(f"💧 자금 유입 증가율 ({f_label} 기준)")
-    c3, c4 = st.columns(2)
-    with c3:
-        g = tbl.sort_values("증가율")
-        fig = go.Figure(go.Bar(
-            x=g["증가율"], y=g["섹터"], orientation="h",
-            marker_color=[UP if v >= 0 else DOWN for v in g["증가율"]],
-            text=[f"{p:+.1f}% → {c:+.1f}%" for p, c in zip(g["직전강도"], g["유입강도"])], textposition="outside",
-            hovertemplate="%{y}<br>증가율 %{x:+.1f}%p<br>직전→최근 유입강도 %{text}<extra></extra>"))
-        fig.add_vline(x=0, line_color=NEUTRAL)
-        fig.update_layout(title=f"유입 강도 변화 (직전 {f_label} → 최근 {f_label}, %p)", height=460,
-                          xaxis_ticksuffix="%p", margin=dict(l=10, r=90, t=50, b=10))
-        st.plotly_chart(fig, width="stretch")
-        st.caption("유입 강도 = 순유입 추정액 ÷ 총 거래대금. 막대가 오른쪽일수록 직전보다 돈이 더 빠르게 들어오는 중.")
-    with c4:
-        by_int = tbl.sort_values("유입강도", ascending=False)["섹터"].tolist()
-        default = by_int[:2] + by_int[-2:]
-        pick = st.multiselect("누적 유입 추이 볼 섹터", tbl["섹터"].tolist(), default=default, key="flow_pick")
-        lookback = max(fn * 3, 30)
-        fig = go.Figure()
-        name2t = {v[0]: k for k, v in SECTORS.items()}
-        for nm in pick:
-            t = name2t[nm]
-            if t in sec_data:
-                cf = A.cumulative_flow(sec_data[t], lookback)
-                fig.add_trace(go.Scatter(x=cf.index, y=cf, name=nm, mode="lines"))
-        if len(sec_data):
-            first = next(iter(sec_data.values()))
-            cut = first.index[-fn] if len(first) > fn else first.index[0]
-            fig.add_vrect(x0=cut, x1=first.index[-1], fillcolor="#90caf9", opacity=0.08, line_width=0,
-                          annotation_text=f"최근 {f_label}", annotation_position="top left")
-        fig.add_hline(y=0, line_dash="dot", line_color=NEUTRAL)
-        fig.update_layout(title=f"누적 순유입 추이 (최근 {lookback}거래일, 평균 일거래대금 대비 %)", height=460,
-                          hovermode="x unified", yaxis_ticksuffix="%", margin=dict(l=10, r=10, t=50, b=10),
-                          legend=dict(orientation="h", y=-0.15))
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        st.plotly_chart(fig, width="stretch")
-        st.caption("선이 꾸준히 오른쪽 위로 가면 지속적인 자금 유입. 100% = 하루치 평균 거래대금만큼 순유입.")
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def guru_data(cik: int, ua: str) -> dict:
+    try:
+        return G.load_guru(_http(), cik, ua)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
-    st.subheader(f"🧭 추세 강도 평가 ({f_label} 기준)")
-    c5, c6 = st.columns([2, 3])
-    with c5:
-        s = tbl.sort_values("추세점수")
-        fig = go.Figure(go.Bar(
-            x=s["추세점수"], y=s["섹터"], orientation="h",
-            marker=dict(color=s["추세점수"], colorscale="RdYlGn", cmin=-100, cmax=100),
-            text=[f"{v:+.0f} · {g}" for v, g in zip(s["추세점수"], s["등급"])], textposition="outside"))
-        fig.add_vline(x=0, line_color=NEUTRAL)
-        fig.update_layout(height=460, xaxis=dict(range=[-130, 130], title="추세 점수 (−100 ~ +100)"),
-                          margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig, width="stretch")
-    with c6:
-        view = tbl.sort_values("추세점수", ascending=False)[
-            ["섹터", "추세점수", "등급", "기간수익률", "유입강도", "증가율", "ADX", "코멘트"]].rename(
-            columns={"기간수익률": f"{f_label} 수익률", "유입강도": "유입강도(%)", "증가율": "증가율(%p)"})
-        st.dataframe(view, hide_index=True, width="stretch", height=460, column_config={
-            "추세점수": st.column_config.NumberColumn(format="%+d"),
-            f"{f_label} 수익률": st.column_config.NumberColumn(format="%+.2f%%"),
-            "유입강도(%)": st.column_config.NumberColumn(format="%+.1f"),
-            "증가율(%p)": st.column_config.NumberColumn(format="%+.1f"),
-            "ADX": st.column_config.NumberColumn(format="%.0f"),
-            "코멘트": st.column_config.TextColumn(width="large"),
-        })
 
-    with st.expander("ℹ️ 지표 계산 방법"):
-        st.markdown(
-            "- **순유입 추정**: 매일 *(종가가 당일 고가~저가 중 어디서 끝났는지, −1~+1) × 거래대금*을 합산. "
-            "실제 ETF 설정/환매 데이터는 유료라서 무료 시세로 만든 **추정치**입니다.\n"
-            "- **유입 강도**: 기간 순유입 ÷ 기간 총 거래대금 × 100. +20% 이상이면 매수세가 강한 편.\n"
-            "- **증가율**: 최근 기간 유입강도 − 직전 같은 기간 유입강도 (%p).\n"
-            "- **추세 점수**: 가격 모멘텀(변동성 대비 수익률) 40% + 유입 강도 35% + 누적 유입선의 일관성 25%를 "
-            "합산하고, ADX(추세 뚜렷함)가 낮으면 점수를 깎습니다. "
-            "+45↑ 강한 상승추세 · +15↑ 상승 우위 · ±15 중립 · −15↓ 하락 우위 · −45↓ 강한 하락추세.")
+def tickers_for(cusips: list[str]) -> dict:
+    store = _figi_store()
+    try:
+        G.map_cusips(_http(), cusips, store, FIGI_KEY)
+    except Exception:
+        pass
+    return store
 
-# ═════════════════════════════════════════════
-# 3) 강세·약세 이유 (뉴스)
-# ═════════════════════════════════════════════
-with tab_news:
-    p_label = st.session_state.get("sector_period", "1주")
-    f_label = st.session_state.get("flow_window", "20일")
-    tbl_n = sector_table(PERIODS[p_label], FLOW_WINDOWS[f_label])
-    top_n = st.slider("강세/약세 섹터 개수", 1, 5, 3)
-    st.caption(f"‘섹터 & 자금흐름’ 탭의 등락률 기간(**{p_label}**) 기준 상위·하위 섹터입니다. "
-               + ("Claude가 뉴스를 읽고 원인을 한국어로 요약합니다." if api_key
-                  else "헤드라인은 한국어로 번역하고 키워드로 테마를 분류합니다. 사이드바에 Claude API 키를 넣으면 원인 분석 요약이 추가됩니다."))
 
-    strong, weak = tbl_n.head(top_n), tbl_n.tail(top_n).iloc[::-1]
+def label_of(cusip: str, name: str, tk: dict) -> str:
+    t = tk.get(cusip)
+    return f"{t} · {str(name).title()}" if t else str(name).title()
 
-    sector_news = {}
-    with st.spinner("뉴스 수집·번역 중…"):
-        for _, r in pd.concat([strong, weak]).iterrows():
-            t = r["티커"]
-            sector_news[t] = news_with_ko(load_news(tuple([t] + SECTORS[t][1])))
 
-    if api_key:
-        rows = []
-        for _, r in pd.concat([strong, weak]).iterrows():
-            heads = "; ".join(sector_news[r["티커"]]["title"].head(4))
-            rows.append(f"- {r['섹터']}({r['티커']}) {r['선택기간']:+.2f}%, 순유입 {fmt_money(r['순유입'])}: {heads}")
+with tab_guru:
+    sel_gurus = st.multiselect("👤 거장·기관 선택", list(G.GURUS), default=G.DEFAULT_GURUS,
+                               format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
+    st.caption("출처: SEC EDGAR 13F-HR 공시 (분기 말 기준, 분기 종료 후 최대 45일 뒤 공개) · 미국 상장 주식 롱 포지션만 포함, "
+               "공매도·현금·해외주식·옵션 제외")
+    guru_res: dict[str, dict] = {}
+    if sel_gurus:
+        prog = st.progress(0.0, text="SEC 공시 불러오는 중…")
+        for i, g in enumerate(sel_gurus, 1):
+            guru_res[g] = guru_data(G.GURUS[g][0], SEC_UA)
+            prog.progress(i / len(sel_gurus), text=f"SEC 공시 불러오는 중… {g}")
+        prog.empty()
+    ok = {g: r for g, r in guru_res.items() if "holdings" in r}
+    for g, r in guru_res.items():
+        if "error" in r:
+            st.warning(f"{g}: 공시를 불러오지 못했습니다 ({r['error']})")
+
+    need = []
+    for r in ok.values():
+        h = r["holdings"]
+        need += h.head(25)["cusip"].tolist() + h[h["status"] == "청산"].head(5)["cusip"].tolist()
+    with st.spinner("종목 티커 변환 중…"):
+        TK = tickers_for(need) if need else {}
+
+    if ok:
+        ov_rows = []
+        for g, r in ok.items():
+            h = r["holdings"]
+            ov_rows.append({"거장": g, "운용사": G.GURUS[g][1], "기준 분기": r["period"], "공시일": r["filed"],
+                            "평가액": r["total"], "전분기 대비": r["value_chg"], "종목 수": int((h["shares"] > 0).sum()),
+                            "신규": int((h["status"] == "신규").sum()), "증가": int((h["status"] == "증가").sum()),
+                            "감소": int((h["status"] == "감소").sum()), "청산": int((h["status"] == "청산").sum()),
+                            "최대 보유": label_of(h.iloc[0]["cusip"], h.iloc[0]["name"], TK) if len(h) else "-"})
+        ovdf = pd.DataFrame(ov_rows)
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            s = ovdf.sort_values("전분기 대비")
+            fig = go.Figure(go.Bar(x=s["전분기 대비"], y=s["거장"], orientation="h",
+                                   marker_color=[UP if v >= 0 else DOWN for v in s["전분기 대비"].fillna(0)],
+                                   text=[f"{v:+.1f}%" for v in s["전분기 대비"]], textposition="outside"))
+            fig.update_layout(title="포트폴리오 평가액 증감률 (전분기 대비)", height=380, xaxis_ticksuffix="%",
+                              margin=dict(l=10, r=40, t=50, b=10))
+            st.plotly_chart(fig, width="stretch")
+        with c2:
+            st.markdown("##### 한눈에 보기")
+            st.dataframe(ovdf.drop(columns=["운용사"]).style.format(
+                {"평가액": lambda v: fmt_money(v).lstrip("+"), "전분기 대비": "{:+.1f}%"}, na_rep="-"),
+                hide_index=True, width="stretch", height=380)
+
+        st.markdown("---")
+        pick = st.selectbox("🔎 자세히 볼 거장", list(ok), format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
+        r = ok[pick]
+        h = r["holdings"].copy()
+        h["종목"] = [label_of(c, n, TK) for c, n in zip(h["cusip"], h["name"])]
+        m = st.columns(5)
+        m[0].metric("기준 분기", r["period"], f"공시 {r['filed']}", delta_color="off")
+        m[1].metric("13F 평가액", fmt_money(r["total"]).lstrip("+"), f"{r['value_chg']:+.1f}% (전분기)")
+        m[2].metric("보유 종목", f"{int((h['shares'] > 0).sum())}개")
+        m[3].metric("상위 5종목 비중", f"{h[h['shares'] > 0].head(5)['weight'].sum():.0f}%")
+        m[4].metric("신규 / 청산", f"{int((h['status'] == '신규').sum())} / {int((h['status'] == '청산').sum())}")
+
         with st.container(border=True):
-            st.markdown("### 🧾 오늘의 섹터 흐름 한눈에")
-            with st.spinner("AI 요약 중…"):
-                st.markdown(ai_cached(N.market_prompt(rows, p_label), api_key, ai_model) or "요약 실패")
+            st.markdown(f"**💬 {pick} 이번 분기 코멘트** <small>(공시 데이터 기반 자동 요약 · 본인 발언 아님)</small>",
+                        unsafe_allow_html=True)
+            for line in G.guru_comment(r, TK):
+                st.markdown(f"- {line}")
+            if api_key:
+                with st.spinner("AI 해설 작성 중…"):
+                    st.markdown("**🤖 AI 해설**  \n" + (ai_cached(G.guru_ai_prompt(pick, r, TK), api_key, ai_model) or ""))
 
-    def render_sector(row, color):
-        t, name, chg = row["티커"], row["섹터"], row["선택기간"]
-        news = sector_news[t]
-        st.markdown(f"#### <span style='color:{color}'>{name} ({t}) {chg:+.2f}%</span>", unsafe_allow_html=True)
-        st.caption(f"순유입 {fmt_money(row['순유입'])} · 추세 {row['등급']} ({row['추세점수']:+.0f}) · "
-                   f"대표종목 {', '.join(SECTORS[t][1])}")
-        if news.empty:
-            st.info("가져온 뉴스가 없습니다.")
-            return
-        render_tone(news)
-        if api_key:
-            flow_text = f"최근 {f_label} 순유입 {fmt_money(row['순유입'])}, 추세 '{row['등급']}'"
-            with st.spinner("AI 요약 중…"):
-                st.markdown(ai_cached(N.sector_prompt(name, t, p_label, chg, flow_text, news), api_key, ai_model)
-                            or "")
-        else:
-            render_rule_summary(news)
-        st.markdown("**📰 주요 헤드라인**")
-        render_headlines(news, 4)
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            top = h[h["shares"] > 0].head(15).iloc[::-1]
+            fig = go.Figure(go.Bar(
+                x=top["weight"], y=top["종목"], orientation="h",
+                marker_color=[STATUS_COLOR[s] for s in top["status"]],
+                text=[f"{w:.1f}% · {STATUS_ICON[s]}" + (f" {c:+.0f}%" if s in ("증가", "감소") else "")
+                      for w, s, c in zip(top["weight"], top["status"], top["share_chg"])],
+                textposition="outside"))
+            fig.update_layout(title=f"{pick} 상위 15 보유종목 (비중 %, 색 = 이번 분기 매매)", height=560,
+                              xaxis=dict(ticksuffix="%", range=[0, top["weight"].max() * 1.45 if len(top) else 1]),
+                              margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig, width="stretch")
+        with c2:
+            buys = h[h["status"].isin(["신규", "증가"])].sort_values("weight", ascending=False).head(8)
+            sells = h[h["status"].isin(["감소", "청산"])].sort_values("weight_prev", ascending=False).head(8)
+            st.markdown("##### 🟢 이번 분기 매수")
+            st.dataframe(pd.DataFrame({"종목": buys["종목"], "구분": buys["status"].map(STATUS_ICON),
+                                       "주식수 변화": buys["share_chg"], "현재 비중": buys["weight"]})
+                         .style.format({"주식수 변화": "{:+.0f}%", "현재 비중": "{:.2f}%"}, na_rep="신규"),
+                         hide_index=True, width="stretch")
+            st.markdown("##### 🔴 이번 분기 매도")
+            st.dataframe(pd.DataFrame({"종목": sells["종목"], "구분": sells["status"].map(STATUS_ICON),
+                                       "주식수 변화": sells["share_chg"], "직전 비중": sells["weight_prev"]})
+                         .style.format({"주식수 변화": "{:+.0f}%", "직전 비중": "{:.2f}%"}, na_rep="-"),
+                         hide_index=True, width="stretch")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("🚀 강세 섹터")
-        for _, r in strong.iterrows():
+        with st.expander(f"📋 {pick} 전체 보유내역 ({len(h)}줄)"):
+            full = pd.DataFrame({"종목": h["종목"], "상태": h["status"].map(STATUS_ICON), "비중": h["weight"],
+                                 "직전 비중": h["weight_prev"], "평가액": h["value"], "주식수": h["shares"],
+                                 "주식수 변화": h["share_chg"], "CUSIP": h["cusip"]})
+            st.dataframe(full.style.format({"비중": "{:.2f}%", "직전 비중": "{:.2f}%",
+                                            "평가액": lambda v: fmt_money(v).lstrip("+"),
+                                            "주식수": "{:,.0f}", "주식수 변화": "{:+.1f}%"}, na_rep="-"),
+                         hide_index=True, width="stretch")
+            st.caption("티커는 OpenFIGI로 CUSIP을 변환한 것이며, 변환 안 된 종목은 회사명으로 표시됩니다.")
+    elif sel_gurus:
+        st.error("선택한 거장의 공시를 하나도 불러오지 못했습니다. 잠시 후 '데이터 새로고침'을 눌러 주세요.")
+
+# ═════════════════════════════════════════════
+# 3) 거장 중복 종목
+# ═════════════════════════════════════════════
+with tab_overlap:
+    ov = G.overlap(ok) if ok else pd.DataFrame()
+    if ov.empty:
+        st.info("‘거장 포트폴리오’ 탭에서 거장을 2명 이상 선택해 주세요.")
+    else:
+        TK = tickers_for(ov.head(60)["cusip"].tolist())
+        ov["티커"] = ov["cusip"].map(TK)
+        ov["종목"] = [label_of(c, n, TK) for c, n in zip(ov["cusip"], ov["name"])]
+        cc = st.columns([2, 2, 3])
+        min_h = cc[0].slider("최소 보유 거장 수", 1, max(2, len(ok)), min(2, len(ok)))
+        top_k = cc[1].slider("표시 개수", 10, 50, 20, step=5)
+        cc[2].caption(f"선택한 거장 {len(ok)}명 기준 · 점수 = 보유 거장 수×10 + 이번 분기 매수 거장×5 + 신규 매수×3 "
+                      "− 매도 거장×4 + 평균 비중×0.5")
+        view = ov[ov["holders"] >= min_h].head(top_k)
+
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            s = view.iloc[::-1]
+            fig = go.Figure(go.Bar(
+                x=s["score"], y=s["종목"], orientation="h",
+                marker=dict(color=s["holders"], colorscale="Tealgrn", showscale=True,
+                            colorbar=dict(title="보유<br>거장 수")),
+                text=[f"{int(hh)}명 보유 · 매수 {int(b)} / 매도 {int(sl)}" for hh, b, sl in
+                      zip(s["holders"], s["buyers"], s["sellers"])],
+                textposition="outside", customdata=s["gurus"],
+                hovertemplate="%{y}<br>점수 %{x}<br>%{customdata}<extra></extra>"))
+            fig.update_layout(title="거장 중복 보유 종목 점수", height=max(420, 26 * len(s) + 80),
+                              xaxis=dict(range=[0, s["score"].max() * 1.5 if len(s) else 1]),
+                              margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig, width="stretch")
+        with c2:
             with st.container(border=True):
-                render_sector(r, UP)
-    with c2:
-        st.subheader("🔻 약세 섹터")
-        for _, r in weak.iterrows():
+                st.markdown("**💬 중복 종목 코멘트** <small>(자동 요약)</small>", unsafe_allow_html=True)
+                for _, rr in view.head(6).iterrows():
+                    trend = ("이번 분기 **매수세**" if rr["buyers"] > rr["sellers"] else
+                             "이번 분기 **매도세**" if rr["sellers"] > rr["buyers"] else "보유 유지")
+                    st.markdown(f"- **{rr['종목']}** — 거장 {int(rr['holders'])}명 보유, {trend} "
+                                f"(매수 {int(rr['buyers'])} · 매도 {int(rr['sellers'])}, 평균 비중 {rr['avg_weight']:.1f}%)")
+                if api_key and len(view):
+                    body = "\n".join(f"- {x['종목']}: 보유 {int(x['holders'])}명 [{x['gurus']}], 매수 {int(x['buyers'])}, "
+                                     f"매도 {int(x['sellers'])}" for _, x in view.head(12).iterrows())
+                    prompt = ("너는 한국 개인투자자를 돕는 애널리스트다. 아래는 유명 투자자들의 13F 공시에서 여러 명이 "
+                              f"동시에 보유한 종목 목록이다.\n\n{body}\n\n이 데이터만 근거로 한국어 3~4문장으로: 거장들이 "
+                              "공통으로 선호하는 테마/섹터, 이번 분기 매수가 몰린 종목, 주의할 점(13F는 45일 지연된 과거 데이터). "
+                              "투자자들의 발언을 지어내지 마라.")
+                    with st.spinner("AI 해설 작성 중…"):
+                        st.markdown("**🤖 AI 해설**  \n" + (ai_cached(prompt, api_key, ai_model) or ""))
+            newbuys = ov[ov["new"] >= 1].sort_values(["new", "holders"], ascending=False).head(10)
+            st.markdown("##### 🆕 이번 분기 새로 산 종목 (신규 매수 거장 수 순)")
+            st.dataframe(pd.DataFrame({"종목": newbuys["종목"], "신규 매수": newbuys["new"].astype(int),
+                                       "보유 거장": newbuys["holders"].astype(int)}),
+                         hide_index=True, width="stretch")
+
+        st.markdown("##### 📋 중복 보유 종목 표")
+        st.dataframe(pd.DataFrame({
+            "종목": view["종목"], "점수": view["score"], "보유 거장 수": view["holders"].astype(int),
+            "보유 거장 (비중)": view["gurus"], "이번 분기 매수": view["buyers"].astype(int),
+            "신규": view["new"].astype(int), "매도": view["sellers"].astype(int), "평균 비중": view["avg_weight"],
+        }).style.format({"점수": "{:.1f}", "평균 비중": "{:.2f}%"}), hide_index=True, width="stretch")
+        st.caption("👈 관심 가는 종목은 사이드바 '내 관심 종목'에 티커를 넣으면 기술적 분석 탭에서 바로 볼 수 있어요.")
+
+# ═════════════════════════════════════════════
+# 4) 애널리스트 강세·약세
+# ═════════════════════════════════════════════
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def analyst_bulk(tickers: tuple[str, ...]) -> dict[str, tuple]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        tk = yf.Ticker(t)
+        out = [None, None, None]
+        for i, attr in enumerate(("upgrades_downgrades", "analyst_price_targets", "recommendations")):
+            try:
+                out[i] = getattr(tk, attr)
+            except Exception:
+                pass
+        return t, (AN.tidy_actions(out[0]), out[1] if isinstance(out[1], dict) else {},
+                   out[2] if isinstance(out[2], pd.DataFrame) else None)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return dict(ex.map(one, tickers))
+
+
+with tab_analyst:
+    cc = st.columns([1.3, 1.3, 1.6, 2.5])
+    days = {"30일": 30, "60일": 60, "90일": 90}[cc[0].radio("의견 집계 기간", ["30일", "60일", "90일"], index=2,
+                                                             horizontal=True)]
+    uni = cc[1].radio("종목 범위", ["핵심 30", "확장 60"], horizontal=True)
+    add_guru = cc[2].checkbox("거장 중복 상위 15종목 포함", value=True)
+    extra = cc[3].text_input("추가로 볼 티커 (쉼표로)", placeholder="예: SOFI, IONQ, RKLB")
+    universe = list(AN.UNIVERSE_CORE) + (list(AN.UNIVERSE_EXT) if uni == "확장 60" else [])
+    if add_guru and ok:
+        ovx = G.overlap(ok)
+        if not ovx.empty:
+            tkx = tickers_for(ovx.head(30)["cusip"].tolist())
+            universe += [tkx[c] for c in ovx[ovx["holders"] >= 2].head(15)["cusip"] if tkx.get(c)]
+    universe += [x.strip().upper() for x in extra.split(",") if x.strip()]
+    if ta_ticker:
+        universe.append(ta_ticker)
+    universe = tuple(dict.fromkeys(universe))
+
+    with st.spinner(f"증권사 의견 수집 중… ({len(universe)}종목, 처음 한 번은 30초~1분 걸려요)"):
+        raw = analyst_bulk(universe)
+    sums = [AN.summarize(t, *raw[t], days=days) for t in universe if t in raw]
+    adf = pd.DataFrame([{k: v for k, v in s_.items() if k != "actions"} for s_ in sums])
+    SM = {s_["ticker"]: s_ for s_ in sums}
+    if adf.empty or adf["firms"].sum() == 0:
+        st.error("애널리스트 데이터를 가져오지 못했습니다. 잠시 후 '데이터 새로고침'을 눌러 주세요.")
+    else:
+        n_show = st.slider("강세/약세 표시 개수", 5, 20, 10)
+        strong = adf.sort_values(["bull_score", "bull_firms"], ascending=False).head(n_show)
+        # 약세: 매도·하향 근거가 있고, 약세 점수가 강세 점수의 절반 이상인 종목만
+        weak = adf[(adf["bear_score"] >= 15) & (adf["bear_score"] >= adf["bull_score"] * 0.5)] \
+            .sort_values(["bear_score", "bear_firms"], ascending=False).head(n_show)
+        st.caption(f"최근 {days}일 증권사별 **최신 의견**을 집계했습니다. 강세 점수 = 매수 의견 증권사 수(35) + 컨센서스 매수 비율(25) "
+                   "+ 목표가 상승여력(20) + 상향·목표가 상향 모멘텀(20). **같은 종목에 매수 의견을 낸 증권사가 많을수록 점수가 높아요.**")
+
+        def score_chart(df_, col, firms_col, title, color):
+            s_ = df_.iloc[::-1]
+            fig = go.Figure(go.Bar(
+                x=s_[col], y=s_["ticker"], orientation="h", marker_color=color,
+                text=[f"{v:.0f}점 · {int(f)}곳" + (f" · 여력 {u:+.0f}%" if pd.notna(u) else "")
+                      for v, f, u in zip(s_[col], s_[firms_col], s_["upside"])], textposition="outside"))
+            fig.update_layout(title=title, height=max(380, 30 * len(s_) + 80), xaxis=dict(range=[0, 135]),
+                              margin=dict(l=10, r=10, t=50, b=10))
+            return fig
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(score_chart(strong, "bull_score", "bull_firms", "🚀 애널리스트 강세 종목 (점수 · 매수 의견 증권사 수)", UP),
+                            width="stretch")
+        with c2:
+            if weak.empty:
+                st.info("집계 기간 내 매도·하향 의견이 뚜렷한 종목이 없습니다.")
+            else:
+                st.plotly_chart(score_chart(weak, "bear_score", "bear_firms", "🔻 애널리스트 약세 종목 (점수 · 매도 의견 증권사 수)", DOWN),
+                                width="stretch")
+
+        def cards(df_, bullish: bool):
+            for _, rr in df_.head(5).iterrows():
+                sm = SM[rr["ticker"]]
+                with st.container(border=True):
+                    st.markdown(f"**{rr['ticker']}** · {'강세' if bullish else '약세'} 점수 "
+                                f"**{rr['bull_score' if bullish else 'bear_score']:.0f}**")
+                    st.markdown(f"<small>💬 {AN.ticker_comment(sm)}</small>", unsafe_allow_html=True)
+                    acts = sm["actions"]
+                    acts = acts[acts["to"].map(AN.stance) == (1 if bullish else -1)].head(3) if len(acts) else acts
+                    for _, a in acts.iterrows():
+                        st.markdown(f"<small>· {a['date']:%m/%d} {AN.action_comment(a, sym_of(rr['ticker']))}</small>",
+                                    unsafe_allow_html=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("##### 🚀 강세 TOP 5 — 증권사 코멘트 <small>(레이팅·목표가 기반 자동 요약)</small>", unsafe_allow_html=True)
+            cards(strong, True)
+        with c2:
+            st.markdown("##### 🔻 약세 TOP 5 — 증권사 코멘트", unsafe_allow_html=True)
+            cards(weak, False)
+
+        with st.expander("📋 전체 종목 표"):
+            tbl = adf.sort_values("bull_score", ascending=False)[
+                ["ticker", "bull_score", "bear_score", "bull_firms", "bear_firms", "ups", "downs", "raises", "lowers",
+                 "buy_ratio", "current", "mean_t", "upside"]].rename(columns={
+                    "ticker": "티커", "bull_score": "강세점수", "bear_score": "약세점수", "bull_firms": "매수의견 증권사",
+                    "bear_firms": "매도의견 증권사", "ups": "상향", "downs": "하향", "raises": "목표가↑", "lowers": "목표가↓",
+                    "buy_ratio": "컨센서스 매수%", "current": "현재가", "mean_t": "평균 목표가", "upside": "상승여력"})
+            st.dataframe(tbl.style.format({"강세점수": "{:.0f}", "약세점수": "{:.0f}", "컨센서스 매수%": "{:.0f}%",
+                                           "현재가": "{:,.2f}", "평균 목표가": "{:,.2f}", "상승여력": "{:+.1f}%"}, na_rep="-"),
+                         hide_index=True, width="stretch")
+
+        # ── 종목 상세
+        st.markdown("---")
+        opts = list(strong["ticker"]) + [t for t in adf["ticker"] if t not in set(strong["ticker"])]
+        dflt = opts.index(ta_ticker) if ta_ticker in opts else 0
+        tsel = st.selectbox("🔎 종목별 애널리스트 의견 자세히", opts, index=dflt)
+        sm = SM[tsel]
+        sy = sym_of(tsel)
+        m = st.columns(5)
+        m[0].metric("강세 / 약세 점수", f"{sm['bull_score']:.0f} / {sm['bear_score']:.0f}")
+        m[1].metric("컨센서스 매수 비율", f"{sm['buy_ratio']:.0f}%" if pd.notna(sm["buy_ratio"]) else "-",
+                    f"애널리스트 {sm['n_analysts']}명", delta_color="off")
+        m[2].metric("평균 목표가", f"{sy}{sm['mean_t']:,.2f}" if sm["mean_t"] else "-",
+                    f"상승여력 {sm['upside']:+.1f}%" if pd.notna(sm["upside"]) else None)
+        m[3].metric(f"최근 {days}일 매수 의견", f"{sm['bull_firms']}곳", f"매도 {sm['bear_firms']}곳", delta_color="off")
+        m[4].metric("상향 / 하향", f"{sm['ups']} / {sm['downs']}", f"목표가 ↑{sm['raises']} ↓{sm['lowers']}", delta_color="off")
+
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            if sm["current"] and sm["low_t"] and sm["high_t"]:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=[sm["low_t"], sm["high_t"]], y=[0, 0], mode="lines",
+                                         line=dict(color="#90a4ae", width=10), name="목표가 범위", hoverinfo="skip"))
+                pts = [("최저", sm["low_t"], DOWN), ("평균", sm["mean_t"], "#42a5f5"), ("최고", sm["high_t"], UP),
+                       ("현재가", sm["current"], "#ffb300")]
+                if avg_cost > 0 and tsel == ta_ticker:
+                    pts.append(("내 평단", avg_cost, "#2962ff"))
+                for nm_, v, col in pts:
+                    fig.add_trace(go.Scatter(x=[v], y=[0], mode="markers+text", marker=dict(size=16, color=col,
+                                             symbol="diamond" if nm_ in ("현재가", "내 평단") else "circle"),
+                                             text=[f"{nm_}<br>{sy}{v:,.0f}"], textposition="top center", name=nm_))
+                tg = sm["actions"].dropna(subset=["pt"]).drop_duplicates("firm")
+                if len(tg):
+                    fig.add_trace(go.Scatter(x=tg["pt"], y=[-0.3] * len(tg), mode="markers", name="증권사별 목표가",
+                                             marker=dict(size=9, color="#ab47bc"), text=tg["firm"],
+                                             hovertemplate="%{text}: %{x:,.0f}<extra></extra>"))
+                fig.update_layout(title=f"{tsel} 목표가 분포", height=300, showlegend=False,
+                                  yaxis=dict(visible=False, range=[-0.6, 0.8]), margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(fig, width="stretch")
             with st.container(border=True):
-                render_sector(r, DOWN)
+                st.markdown(f"**💬 {tsel} 애널리스트 시각** <small>(자동 요약)</small>", unsafe_allow_html=True)
+                st.markdown(AN.ticker_comment(sm))
+                with st.spinner("관련 뉴스 수집 중…"):
+                    nn = load_news((tsel,), per_ticker=20)
+                    nn = nn[nn["title"].map(AN.is_analyst_headline)] if not nn.empty else nn
+                    nn = news_with_ko(nn.head(6)) if not nn.empty else nn
+                if api_key:
+                    with st.spinner("AI 해설 작성 중…"):
+                        st.markdown("**🤖 AI 해설**  \n" + (ai_cached(AN.analyst_ai_prompt(
+                            sm, nn["title"].tolist() if not nn.empty else []), api_key, ai_model) or ""))
+                if not nn.empty:
+                    st.markdown("**📰 애널리스트 관련 뉴스**")
+                    render_headlines(nn, 6)
+        with c2:
+            acts = sm["actions"]
+            if acts.empty:
+                st.info(f"최근 {days}일 내 증권사 의견 변경이 없습니다. 기간을 늘려 보세요.")
+            else:
+                st.markdown(f"##### 🏦 증권사별 의견 (최근 {days}일, 최신순)")
+                st.dataframe(pd.DataFrame({
+                    "날짜": acts["date"].dt.strftime("%Y-%m-%d"), "증권사": acts["firm"],
+                    "의견": acts["to"].map(lambda g: ("🟢 " if AN.stance(g) > 0 else "🔴 " if AN.stance(g) < 0 else "⚪ ")
+                                                     + AN.ko_grade(g)),
+                    "변경": acts["action"].map(lambda a: AN.KO_ACTION.get(str(a).lower(), a)),
+                    "목표가": acts["pt"], "이전 목표가": acts["pt_prior"],
+                    "코멘트": [AN.action_comment(a, sy) for _, a in acts.iterrows()],
+                }).style.format({"목표가": sy + "{:,.0f}", "이전 목표가": sy + "{:,.0f}"}, na_rep="-"),
+                    hide_index=True, width="stretch", height=min(600, 38 * len(acts) + 40))
+        st.caption("데이터: Yahoo Finance 증권사 레이팅·목표가. 코멘트는 레이팅 변경을 요약한 것으로, 증권사 리포트 원문이 아닙니다.")
 
 # ═════════════════════════════════════════════
 # 4) 기술적 분석
