@@ -170,6 +170,20 @@ def slice_months(df: pd.DataFrame, months: int) -> pd.DataFrame:
     return df[df.index >= df.index[-1] - pd.DateOffset(months=months)]
 
 
+CHART_LOCK = True
+
+
+def show_chart(fig, **_):
+    """모든 차트 공통 표시. 잠금이면 터치/드래그로 확대·이동되지 않고, 탭하면 값만 보임."""
+    if CHART_LOCK:
+        fig.update_layout(dragmode=False)
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+    st.plotly_chart(fig, width="stretch", config={
+        "scrollZoom": False, "doubleClick": False if CHART_LOCK else "reset",
+        "displayModeBar": not CHART_LOCK, "displaylogo": False, "responsive": True})
+
+
 def get_secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, default)
@@ -252,6 +266,8 @@ def render_rule_summary(news: pd.DataFrame):
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 설정")
+    CHART_LOCK = st.toggle("📱 차트 확대·이동 잠금", value=True,
+                           help="켜면 손가락으로 차트를 만져도 확대/축소되지 않습니다 (탭하면 값 표시). PC에서 확대해 보고 싶을 때만 끄세요.")
     if st.button("🔄 데이터 새로고침", width="stretch"):
         st.cache_data.clear()
     st.caption("데이터는 10분간 캐시됩니다.")
@@ -342,7 +358,7 @@ with tab_idx:
         fig.update_layout(title=(f"{ta_ticker} vs {INDICES[sel]}" if ta_ticker else INDICES[sel]) + f" 수익률 ({iv} · {rng})", height=460,
                           hovermode="x unified", yaxis_ticksuffix="%", bargap=0,
                           margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.12))
-        st.plotly_chart(fig, width="stretch")
+        show_chart(fig)
 
         if series and norm.shape[1] == 2:
             r = comb.pct_change().dropna()
@@ -373,7 +389,7 @@ with tab_idx:
                              title=f"{INDICES[sel]} {iv} ({rng})", legend=dict(orientation="h", y=-0.12))
             if iv == "일봉" and not sel.endswith("-USD"):  # 코인은 주말에도 거래
                 f2.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-            st.plotly_chart(f2, width="stretch")
+            show_chart(f2)
 
 # ═════════════════════════════════════════════
 # 2) 거장 포트폴리오 (SEC 13F)
@@ -509,7 +525,7 @@ with tab_guru:
                                    text=[f"{v:+.1f}%" for v in s["전분기 대비"]], textposition="outside"))
             fig.update_layout(title="포트폴리오 평가액 증감률 (전분기 대비)", height=380, xaxis_ticksuffix="%",
                               margin=dict(l=10, r=40, t=50, b=10))
-            st.plotly_chart(fig, width="stretch")
+            show_chart(fig)
         with c2:
             st.markdown("##### 한눈에 보기")
             st.dataframe(ovdf.drop(columns=["운용사"]).style.format(
@@ -549,7 +565,7 @@ with tab_guru:
             fig.update_layout(title=f"{pick} 상위 15 보유종목 (비중 %, 색 = 이번 분기 매매)", height=560,
                               xaxis=dict(ticksuffix="%", range=[0, top["weight"].max() * 1.45 if len(top) else 1]),
                               margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, width="stretch")
+            show_chart(fig)
         with c2:
             buys = h[h["status"].isin(["신규", "증가"])].sort_values("weight", ascending=False).head(8)
             sells = h[h["status"].isin(["감소", "청산"])].sort_values("weight_prev", ascending=False).head(8)
@@ -634,7 +650,7 @@ with tab_overlap:
             fig.update_layout(title="거장 중복 보유 종목 점수", height=max(420, 26 * len(s) + 80),
                               xaxis=dict(range=[0, s["score"].max() * 1.5 if len(s) else 1]),
                               margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, width="stretch")
+            show_chart(fig)
         with c2:
             with st.container(border=True):
                 st.markdown("**💬 중복 종목 코멘트** <small>(자동 요약)</small>", unsafe_allow_html=True)
@@ -735,14 +751,12 @@ with tab_analyst:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(score_chart(strong, "bull_score", "bull_firms", "🚀 애널리스트 강세 종목 (점수 · 매수 의견 증권사 수)", UP),
-                            width="stretch")
+            show_chart(score_chart(strong, "bull_score", "bull_firms", "🚀 애널리스트 강세 종목 (점수 · 매수 의견 증권사 수)", UP))
         with c2:
             if weak.empty:
                 st.info("집계 기간 내 매도·하향 의견이 뚜렷한 종목이 없습니다.")
             else:
-                st.plotly_chart(score_chart(weak, "bear_score", "bear_firms", "🔻 애널리스트 약세 종목 (점수 · 매도 의견 증권사 수)", DOWN),
-                                width="stretch")
+                show_chart(score_chart(weak, "bear_score", "bear_firms", "🔻 애널리스트 약세 종목 (점수 · 매도 의견 증권사 수)", DOWN))
 
         def cards(df_, bullish: bool):
             for _, rr in df_.head(5).iterrows():
@@ -813,7 +827,7 @@ with tab_analyst:
                                              hovertemplate="%{text}: %{x:,.0f}<extra></extra>"))
                 fig.update_layout(title=f"{tsel} 목표가 분포", height=300, showlegend=False,
                                   yaxis=dict(visible=False, range=[-0.6, 0.8]), margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(fig, width="stretch")
+                show_chart(fig)
             with st.container(border=True):
                 st.markdown(f"**💬 {tsel} 애널리스트 시각** <small>(자동 요약)</small>", unsafe_allow_html=True)
                 st.markdown(AN.ticker_comment(sm))
@@ -946,7 +960,7 @@ with tab_rec:
         fig.update_layout(barmode="stack", title="종합 매수 후보 점수 (100점 만점, 색 = 항목별 기여)",
                           height=max(420, 30 * len(s_) + 100), xaxis=dict(range=[0, 108]),
                           legend=dict(orientation="h", y=-0.08), margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, width="stretch")
+        show_chart(fig)
 
         st.markdown("##### 🏆 TOP 5 — 선정 이유 <small>(자동 요약)</small>", unsafe_allow_html=True)
         cols5 = st.columns(min(5, len(top)) or 1)
@@ -1080,7 +1094,7 @@ with tab_fund:
                 fig.update_layout(polar=dict(radialaxis=dict(range=[0, 10], tickvals=[2, 4, 6, 8, 10])), height=400,
                                   title="분야별 점수 vs 동종 평균", margin=dict(l=30, r=30, t=60, b=20),
                                   legend=dict(orientation="h", y=-0.1))
-                st.plotly_chart(fig, width="stretch")
+                show_chart(fig)
             with c2:
                 s_ = fd.sort_values("total")
                 fig = go.Figure(go.Bar(
@@ -1089,7 +1103,7 @@ with tab_fund:
                     text=[f"{v:.1f}" for v in s_["total"].astype(float)], textposition="outside"))
                 fig.update_layout(title="종합 점수 순위 (10점 만점)", height=400, xaxis=dict(range=[0, 11]),
                                   margin=dict(l=10, r=10, t=60, b=10))
-                st.plotly_chart(fig, width="stretch")
+                show_chart(fig)
 
             with st.container(border=True):
                 st.markdown(f"**💬 {f_ticker} 재무 코멘트** <small>(동종 비교 자동 요약)</small>", unsafe_allow_html=True)
@@ -1278,7 +1292,7 @@ with tab_ta:
     if t_iv == "일봉" and not is_crypto:
         for row in (1, 2, 3):
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=row, col=1)
-    st.plotly_chart(fig, width="stretch")
+    show_chart(fig)
     st.caption(f"지지/저항 자동 감도: 스윙 {eff_order}봉 · 표시 {len(d)}봉 기준 — 크게 솟은 고점·저점과 여러 번 닿은 가격 위주로, "
                "서로 4% 이상 떨어진 큰 레벨만 표시합니다.")
 
@@ -1442,6 +1456,6 @@ with tab_ta:
                      margin=dict(l=10, r=10, t=50, b=10))
     if t_iv == "일봉" and not is_crypto:
         pf.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    st.plotly_chart(pf, width="stretch")
+    show_chart(pf)
     st.caption("매수가는 지지선 살짝 위(+0.1 ATR), 매도가는 저항선 살짝 아래(−0.1 ATR)로 잡아 체결 가능성을 높였습니다. "
                "계산 결과는 참고용입니다.")
