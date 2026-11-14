@@ -402,6 +402,56 @@ def guru_data(cik: int, ua: str) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def guru_history(cik: int, ua: str, n: int = 16) -> dict:
+    try:
+        return G.load_history(_http(), cik, ua, n)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def price_raw(tickers: tuple[str, ...]) -> dict:
+    """배당 미반영(분할만 반영) 종가 5년 + 분할 이력."""
+    out = {}
+    try:
+        raw = yf.download(list(tickers), period="5y", interval="1d", group_by="ticker",
+                          auto_adjust=False, progress=False, threads=True)
+    except Exception:
+        raw = None
+    for t in tickers:
+        close = None
+        try:
+            d = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+            close = d["Close"].dropna()
+            close.index = pd.to_datetime(close.index).tz_localize(None)
+        except Exception:
+            pass
+        try:
+            sp = yf.Ticker(t).splits
+        except Exception:
+            sp = None
+        out[t] = (close, sp)
+    return out
+
+
+def guru_costs(guru: str, cusips_tickers: list[tuple[str, str]]) -> dict[str, dict]:
+    """{cusip: estimate_cost 결과 + 현재가} — 해당 거장의 최근 16분기 공시로 추정."""
+    hist = guru_history(G.GURUS[guru][0], SEC_UA)
+    if not hist:
+        return {}
+    px = price_raw(tuple(t for _, t in cusips_tickers if t))
+    out = {}
+    for c, t in cusips_tickers:
+        close, sp = px.get(t, (None, None)) if t else (None, None)
+        est = G.estimate_cost(hist, c, close, sp)
+        if est:
+            est["price"] = float(close.iloc[-1]) if close is not None and len(close) else np.nan
+            est["n_q"] = len(hist)
+            out[c] = est
+    return out
+
+
 def tickers_for(cusips: list[str]) -> dict:
     store = _figi_store()
     try:
@@ -512,6 +562,32 @@ with tab_guru:
                                        "주식수 변화": sells["share_chg"], "직전 비중": sells["weight_prev"]})
                          .style.format({"주식수 변화": "{:+.0f}%", "직전 비중": "{:.2f}%"}, na_rep="-"),
                          hide_index=True, width="stretch")
+
+        st.markdown(f"##### 📌 {pick} 추정 평단가 <small>(최근 4년 13F 기반 추정 · 실제 매입가 아님)</small>",
+                    unsafe_allow_html=True)
+        top_ct = [(c, TK.get(c)) for c in h[h["shares"] > 0].head(12)["cusip"]]
+        with st.spinner("과거 공시로 평단 추정 중… (처음 한 번 10~20초)"):
+            costs = guru_costs(pick, top_ct)
+        if costs:
+            crow = []
+            for c, t in top_ct:
+                e = costs.get(c)
+                if not e:
+                    continue
+                hr = h[h["cusip"] == c].iloc[0]
+                ret = (e["price"] / e["avg_cost"] - 1) * 100 if pd.notna(e["price"]) and e["avg_cost"] else np.nan
+                crow.append({"종목": hr["종목"], "비중": hr["weight"],
+                             "보유 시작": ("≤ " if e["start_in_window"] else "") + str(e["first_period"] or "-"),
+                             "추정 평단": ("≤ " if e["start_in_window"] else "") + (f"${e['avg_cost']:,.2f}" if t else "-"),
+                             "현재가": e["price"], "추정 수익률": ret})
+            st.dataframe(pd.DataFrame(crow).style.format({"비중": "{:.1f}%", "현재가": "${:,.2f}",
+                                                          "추정 수익률": "{:+.1f}%"}, na_rep="-"),
+                         hide_index=True, width="stretch")
+            st.caption("방법: 분기마다 늘어난 주식 수를 그 분기 평균 종가에 샀다고 보고 가중평균(평균단가법, 액면분할 반영). "
+                       "'≤' 표시는 조회 기간(4년) 이전부터 보유 → 실제 평단은 이보다 낮을 가능성이 큽니다. "
+                       "기술적 분석 탭 차트에도 선으로 표시됩니다.")
+        else:
+            st.info("평단을 추정할 과거 공시를 불러오지 못했습니다.")
 
         with st.expander(f"📋 {pick} 전체 보유내역 ({len(h)}줄)"):
             full = pd.DataFrame({"종목": h["종목"], "상태": h["status"].map(STATUS_ICON), "비중": h["weight"],
@@ -943,6 +1019,55 @@ with tab_ta:
     m[4].metric("POC(최대 매물대)", f"{SYM}{vp['poc']:,.2f}",
                 f"현재가 대비 {(close / vp['poc'] - 1) * 100:+.1f}%", delta_color="off")
 
+    # ── 이 종목을 보유한 거장 & 추정 평단
+    guru_lines = []
+    if ok:
+        store = _figi_store()
+        try:
+            my_name = (fetch_infos((ta_ticker,)).get(ta_ticker, {}) or {}).get("longName", "") or ""
+        except Exception:
+            my_name = ""
+
+        def _norm(x):
+            import re as _re
+            x = _re.sub(r"[^A-Z0-9 ]", " ", str(x).upper())
+            stop = {"INC", "CORP", "CORPORATION", "CO", "LTD", "PLC", "HOLDINGS", "HLDGS", "CL", "A", "B", "C",
+                    "COM", "NEW", "THE", "GROUP", "SA", "NV", "N", "V", "DEL", "LLC"}
+            return " ".join(w for w in x.split() if w not in stop)[:18]
+        for g, r_ in ok.items():
+            hh = r_["holdings"]
+            hh = hh[hh["shares"] > 0]
+            cands = hh[hh["cusip"].map(store.get) == ta_ticker]
+            if cands.empty and my_name:
+                byname = hh[hh["name"].map(_norm) == _norm(my_name)]
+                if len(byname):
+                    tickers_for(byname["cusip"].tolist())
+                    cands = byname[byname["cusip"].map(store.get).isin([ta_ticker, None])]
+            if cands.empty:
+                continue
+            cus = cands.iloc[0]["cusip"]
+            est = guru_costs(g, [(cus, ta_ticker)]).get(cus)
+            guru_lines.append({"거장": g, "비중": float(cands.iloc[0]["weight"]), "상태": cands.iloc[0]["status"],
+                               "평단": est["avg_cost"] if est else np.nan,
+                               "≤": bool(est and est["start_in_window"]),
+                               "보유 시작": est["first_period"] if est else "-"})
+    if guru_lines:
+        with st.container(border=True):
+            show_g = st.toggle("🏛️ 차트에 거장 추정 평단 표시", value=True, key="show_guru_cost")
+            gl = pd.DataFrame(guru_lines)
+            gl["현재가 대비"] = (close / gl["평단"] - 1) * 100
+            st.dataframe(pd.DataFrame({
+                "거장": gl["거장"], "포트폴리오 비중": gl["비중"], "이번 분기": gl["상태"].map(STATUS_ICON),
+                "추정 평단": [("≤ " if le else "") + (f"{SYM}{v:,.2f}" if pd.notna(v) else "-") for v, le in zip(gl["평단"], gl["≤"])],
+                "현재가 대비": gl["현재가 대비"], "보유 시작": gl["보유 시작"]})
+                .style.format({"포트폴리오 비중": "{:.2f}%", "현재가 대비": "{:+.1f}%"}, na_rep="-"),
+                hide_index=True, width="stretch")
+            st.caption("13F 공시 기반 추정치 (실제 매입가 아님). '≤'는 4년 이전부터 보유해 실제 평단이 더 낮을 수 있다는 뜻.")
+    else:
+        show_g = False
+        if ok:
+            st.caption(f"선택한 거장 중 {ta_ticker}를 보유한 사람이 없습니다 (거장 탭에서 선택한 거장 기준).")
+
     if avg_cost > 0 and cur_qty > 0:
         pl = (close - avg_cost) * cur_qty
         pm = st.columns(4)
@@ -979,6 +1104,16 @@ with tab_ta:
         fig.add_hline(y=avg_cost, line=dict(color="#2962ff", width=3), row=1, col=1,
                       annotation_text=f"내 평단 {SYM}{avg_cost:,.2f}" + (f" ({(close / avg_cost - 1) * 100:+.1f}%)"),
                       annotation_position="top right", annotation_font=dict(color="#2962ff", size=13))
+    if show_g:
+        palette = ["#ffd600", "#ff6d00", "#d500f9", "#00e5ff", "#76ff03", "#ff4081", "#ffab40", "#b388ff"]
+        for i, gr in enumerate(guru_lines):
+            if pd.isna(gr["평단"]):
+                continue
+            col_ = palette[i % len(palette)]
+            fig.add_hline(y=gr["평단"], line=dict(color=col_, width=2, dash="dot"), row=1, col=1,
+                          annotation_text=f"🏛️ {gr['거장']} 평단 {'≤' if gr['≤'] else ''}{SYM}{gr['평단']:,.2f}",
+                          annotation_position="top left" if i % 2 == 0 else "bottom left",
+                          annotation_font=dict(color=col_, size=12))
     lv = vp["levels"]
     in_va = (lv["price_mid"] >= vp["val"]) & (lv["price_mid"] <= vp["vah"])
     fig.add_trace(go.Bar(x=lv["volume"], y=lv["price_mid"], orientation="h", name="매물대",

@@ -294,3 +294,76 @@ def guru_ai_prompt(guru: str, res: dict, tickers: dict) -> str:
 
 이 데이터만 근거로 한국어 3~4문장으로 해설하라: 이번 분기 매매의 큰 방향(어떤 섹터·테마를 늘리고 줄였는지),
 눈에 띄는 결정 1~2개, 개인투자자가 참고할 점. {guru}가 실제로 한 말처럼 인용하지 말고, 공시 데이터 해석임을 분명히 하라."""
+
+
+# ─────────────────────────────────────────────
+# 추정 평단가 (13F에는 매입가가 없으므로 분기별 증감 × 분기 평균가로 추정)
+# ─────────────────────────────────────────────
+
+def load_history(session, cik: int, ua: str, n: int = 16) -> dict[str, pd.DataFrame]:
+    """최근 n개 분기 {분기말 'YYYY-MM-DD': CUSIP별 집계 보유내역}."""
+    _, filings = list_13f(session, cik, ua)
+    out = {}
+    for f in filings[:n]:
+        try:
+            out[f["period"]] = aggregate(fetch_holdings(session, cik, f["accession"], ua))
+        except Exception:
+            continue
+    return out
+
+
+def split_factor(splits: pd.Series | None, when: pd.Timestamp) -> float:
+    """when 이후 발생한 액면분할 비율의 곱 (과거 주식 수 → 현재 기준)."""
+    if splits is None or len(splits) == 0:
+        return 1.0
+    s = splits.copy()
+    s.index = pd.to_datetime(s.index).tz_localize(None) if getattr(s.index, "tz", None) else pd.to_datetime(s.index)
+    after = s[s.index > when]
+    return float(np.prod(after.values)) if len(after) else 1.0
+
+
+def estimate_cost(history: dict[str, pd.DataFrame], cusip: str, close: pd.Series | None,
+                  splits: pd.Series | None = None) -> dict | None:
+    """
+    평균단가법: 분기마다 늘어난 주식 수는 그 분기 평균 종가에 매수, 줄어든 만큼은 평단 유지한 채 매도.
+    close: 일별 종가(분할 반영). 없으면 13F의 분기말 평가액/주식수로 대체.
+    반환: avg_cost, shares(현재 기준), first_period, start_in_window(조회 시작 분기부터 보유했는지), trail(분기별 표)
+    """
+    periods = sorted(history)
+    if not periods:
+        return None
+    if close is not None and len(close):
+        close = close.copy()
+        close.index = pd.to_datetime(close.index).tz_localize(None) if getattr(close.index, "tz", None) else pd.to_datetime(close.index)
+    prev, cost, rows, first = 0.0, 0.0, [], None
+    for p in periods:
+        h = history[p]
+        row = h[h["cusip"] == cusip]
+        when = pd.Timestamp(p)
+        raw_sh = float(row["shares"].sum()) if len(row) else 0.0
+        sh = raw_sh * split_factor(splits, when)
+        qp = np.nan
+        if close is not None and len(close):
+            win = close[(close.index > when - pd.DateOffset(months=3)) & (close.index <= when)]
+            if len(win):
+                qp = float(win.mean())
+        if pd.isna(qp) and raw_sh > 0:
+            qp = float(row["value"].sum()) / sh  # 분기말 가격으로 대체
+        action = "-"
+        if sh > prev:
+            if pd.notna(qp):
+                cost += (sh - prev) * qp
+            action = "신규" if prev == 0 else "추가매수"
+            first = first or p
+        elif sh < prev:
+            cost *= sh / prev if prev else 0
+            action = "전량매도" if sh == 0 else "일부매도"
+            if sh == 0:
+                first = None
+        prev = sh
+        rows.append({"분기": p, "보유주식(현재 기준)": sh, "분기 평균가": qp, "매매": action,
+                     "누적 추정 평단": cost / sh if sh else np.nan})
+    if prev <= 0:
+        return None
+    return {"avg_cost": cost / prev, "shares": prev, "first_period": first,
+            "start_in_window": first == periods[0], "trail": pd.DataFrame(rows)}
