@@ -16,6 +16,7 @@ from plotly.subplots import make_subplots
 
 import analysis as A
 import analysts as AN
+import fundamentals as FU
 import gurus as G
 import news_ko as N
 
@@ -278,8 +279,8 @@ SYM = sym_of(ta_ticker)
 st.title("📈 마켓 대시보드")
 st.caption(f"Yahoo Finance 기준 (약 15분 지연) · 조회 시각 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-tab_idx, tab_guru, tab_overlap, tab_analyst, tab_ta = st.tabs(
-    ["📊 주요 지수", "🏛️ 거장 포트폴리오", "🔁 거장 중복 종목", "📑 애널리스트 강세·약세",
+tab_idx, tab_guru, tab_overlap, tab_analyst, tab_fund, tab_ta = st.tabs(
+    ["📊 주요 지수", "🏛️ 거장 포트폴리오", "🔁 거장 중복 종목", "📑 애널리스트 강세·약세", "🧮 재무 비교",
      f"🪙 {ta_ticker or '종목'} 기술적 분석"])
 
 # ═════════════════════════════════════════════
@@ -766,6 +767,134 @@ with tab_analyst:
                 }).style.format({"목표가": sy + "{:,.0f}", "이전 목표가": sy + "{:,.0f}"}, na_rep="-"),
                     hide_index=True, width="stretch", height=min(600, 38 * len(acts) + 40))
         st.caption("데이터: Yahoo Finance 증권사 레이팅·목표가. 코멘트는 레이팅 변경을 요약한 것으로, 증권사 리포트 원문이 아닙니다.")
+
+# ═════════════════════════════════════════════
+# 5) 재무 비교 (동종업계 대비 10점 만점)
+# ═════════════════════════════════════════════
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def auto_peers(ticker: str) -> tuple[list[str], str]:
+    """같은 산업 대표 종목 (Yahoo 산업 분류) → 실패 시 섹터 → 기본 목록."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        info = {}
+    for key, cls, label in (("industryKey", "Industry", info.get("industry")),
+                            ("sectorKey", "Sector", info.get("sector"))):
+        k = info.get(key)
+        if not k or not hasattr(yf, cls):
+            continue
+        try:
+            tc = getattr(yf, cls)(k).top_companies
+            if tc is not None and len(tc):
+                syms = [str(s) for s in tc.index if str(s).upper() != ticker.upper()]
+                if syms:
+                    return syms[:12], f"{'산업' if cls == 'Industry' else '섹터'}: {label}"
+        except Exception:
+            pass
+    return FU.FALLBACK_PEERS.get(ticker.upper(), []), "기본 경쟁사 목록"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_infos(tickers: tuple[str, ...]) -> dict[str, dict]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        try:
+            return t, yf.Ticker(t).info or {}
+        except Exception:
+            return t, {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return dict(ex.map(one, tickers))
+
+
+with tab_fund:
+    cc = st.columns([1.2, 3])
+    f_ticker = cc[0].text_input("분석할 티커", value=ta_ticker, placeholder="예: COIN",
+                                key="fund_ticker").strip().upper()
+    if not f_ticker:
+        st.info("티커를 입력하면 같은 산업 경쟁사와 PER·PBR·ROE·부채비율 등을 비교해 10점 만점으로 점수를 매깁니다.")
+    else:
+        with st.spinner("경쟁사 찾는 중…"):
+            peers_auto, peer_src = auto_peers(f_ticker)
+        extra_p = cc[1].text_input("경쟁사 직접 추가 (쉼표로)", placeholder="예: HOOD, SCHW", key="fund_extra")
+        extras = [x.strip().upper() for x in extra_p.split(",") if x.strip()]
+        options = list(dict.fromkeys(peers_auto + extras))
+        peers = st.multiselect(f"비교할 경쟁사 (자동 추천 — {peer_src})", options,
+                               default=list(dict.fromkeys(peers_auto[:8] + extras)), key=f"fund_peers_{f_ticker}")
+        group = tuple(dict.fromkeys([f_ticker] + peers))
+        with st.spinner(f"재무 데이터 불러오는 중… ({len(group)}종목)"):
+            infos = fetch_infos(group)
+        rows = {t: FU.extract(infos.get(t, {})) for t in group if infos.get(t)}
+        if f_ticker not in rows or len(rows) < 3:
+            st.warning("비교할 재무 데이터가 부족합니다. 티커를 확인하거나 경쟁사를 2개 이상 선택해 주세요.")
+        else:
+            fd = FU.score_peers(rows)
+            me = fd.loc[f_ticker]
+            tot = float(me["total"])
+            rank = int((fd["total"].astype(float) > tot).sum() + 1)
+            color = UP if tot >= 6.5 else DOWN if tot < 4 else "#ffb300"
+            st.markdown(
+                f"<div style='display:flex;align-items:baseline;gap:16px;margin:6px 0'>"
+                f"<span style='font-size:1.1rem'><b>{f_ticker}</b> {me['name']} · <small>{me['industry']}</small></span></div>"
+                f"<div style='display:flex;align-items:center;gap:18px'>"
+                f"<span style='font-size:3rem;font-weight:800;color:{color}'>{tot:.1f}<small style='font-size:1.1rem'> / 10</small></span>"
+                f"<span>동종 {len(fd)}개 중 <b>{rank}위</b><br><small>지표별 경쟁사 내 순위를 0~10점으로 환산한 평균</small></span></div>",
+                unsafe_allow_html=True)
+            m = st.columns(4)
+            for col_, c in zip(m, FU.CATEGORIES):
+                v = me[f"cat_{c}"]
+                avg = fd[f"cat_{c}"].astype(float).mean()
+                col_.metric(c, f"{v:.1f} / 10" if pd.notna(v) else "-",
+                            f"동종 평균 대비 {v - avg:+.1f}" if pd.notna(v) else None)
+
+            c1, c2 = st.columns([2, 3])
+            with c1:
+                cats = FU.CATEGORIES + [FU.CATEGORIES[0]]
+                mine = [float(me[f"cat_{c}"]) if pd.notna(me[f"cat_{c}"]) else 0 for c in FU.CATEGORIES]
+                peer_avg = [float(fd[f"cat_{c}"].astype(float).mean()) for c in FU.CATEGORIES]
+                fig = go.Figure()
+                fig.add_trace(go.Scatterpolar(r=peer_avg + peer_avg[:1], theta=cats, fill="toself", name="동종 평균",
+                                              line=dict(color="#90a4ae")))
+                fig.add_trace(go.Scatterpolar(r=mine + mine[:1], theta=cats, fill="toself", name=f_ticker,
+                                              line=dict(color="#2962ff", width=3)))
+                fig.update_layout(polar=dict(radialaxis=dict(range=[0, 10], tickvals=[2, 4, 6, 8, 10])), height=400,
+                                  title="분야별 점수 vs 동종 평균", margin=dict(l=30, r=30, t=60, b=20),
+                                  legend=dict(orientation="h", y=-0.1))
+                st.plotly_chart(fig, width="stretch")
+            with c2:
+                s_ = fd.sort_values("total")
+                fig = go.Figure(go.Bar(
+                    x=s_["total"].astype(float), y=[f"{t} · {n[:18]}" for t, n in zip(s_.index, s_["name"])],
+                    orientation="h", marker_color=["#2962ff" if t == f_ticker else "#90a4ae" for t in s_.index],
+                    text=[f"{v:.1f}" for v in s_["total"].astype(float)], textposition="outside"))
+                fig.update_layout(title="종합 점수 순위 (10점 만점)", height=400, xaxis=dict(range=[0, 11]),
+                                  margin=dict(l=10, r=10, t=60, b=10))
+                st.plotly_chart(fig, width="stretch")
+
+            with st.container(border=True):
+                st.markdown(f"**💬 {f_ticker} 재무 코멘트** <small>(동종 비교 자동 요약)</small>", unsafe_allow_html=True)
+                for line in FU.comments(fd, f_ticker):
+                    st.markdown(f"- {line}")
+                if api_key:
+                    with st.spinner("AI 해설 작성 중…"):
+                        st.markdown("**🤖 AI 해설**  \n" + (ai_cached(FU.ai_prompt(fd, f_ticker), api_key, ai_model) or ""))
+
+            st.markdown("##### 📋 지표별 비교")
+            st.dataframe(FU.metric_table(fd, f_ticker), hide_index=True, width="stretch", height=600,
+                         column_config={"점수": st.column_config.ProgressColumn(
+                             "점수 (/10)", min_value=0, max_value=10, format="%.1f")})
+
+            with st.expander("🏢 경쟁사 전체 지표 보기"):
+                show_k = ["per", "fper", "pbr", "psr", "ev", "roe", "opm", "npm", "rev_g", "eps_g", "de", "cur", "fcf_y"]
+                comp = pd.DataFrame({"종목": [f"{t} · {fd.at[t, 'name']}" for t in fd.index],
+                                     "종합": fd["total"].astype(float).round(1).values,
+                                     **{FU.METRICS[k][0]: [FU.fmt_val(k, fd.at[t, k]) for t in fd.index] for k in show_k}})
+                comp = comp.sort_values("종합", ascending=False)
+                st.dataframe(comp, hide_index=True, width="stretch")
+            st.caption("데이터: Yahoo Finance (최근 12개월·최근 분기 기준). 점수는 '선택한 경쟁사 안에서의 상대 순위'라서 "
+                       "경쟁사 구성이 바뀌면 점수도 바뀝니다. 적자 기업의 PER 등은 최하점 처리됩니다.")
 
 # ═════════════════════════════════════════════
 # 4) 기술적 분석
