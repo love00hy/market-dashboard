@@ -19,6 +19,7 @@ import analysts as AN
 import fundamentals as FU
 import gurus as G
 import news_ko as N
+import recommend as R
 
 st.set_page_config(page_title="마켓 대시보드", page_icon="📈", layout="wide")
 
@@ -279,9 +280,9 @@ SYM = sym_of(ta_ticker)
 st.title("📈 마켓 대시보드")
 st.caption(f"Yahoo Finance 기준 (약 15분 지연) · 조회 시각 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-tab_idx, tab_guru, tab_overlap, tab_analyst, tab_fund, tab_ta = st.tabs(
-    ["📊 주요 지수", "🏛️ 거장 포트폴리오", "🔁 거장 중복 종목", "📑 애널리스트 강세·약세", "🧮 재무 비교",
-     f"🪙 {ta_ticker or '종목'} 기술적 분석"])
+tab_idx, tab_guru, tab_overlap, tab_analyst, tab_rec, tab_fund, tab_ta = st.tabs(
+    ["📊 주요 지수", "🏛️ 거장 포트폴리오", "🔁 거장 중복 종목", "📑 애널리스트 강세·약세", "🏆 종합 추천",
+     "🧮 재무 비교", f"🪙 {ta_ticker or '종목'} 기술적 분석"])
 
 # ═════════════════════════════════════════════
 # 1) 주요 지수
@@ -843,6 +844,147 @@ with tab_analyst:
                 }).style.format({"목표가": sy + "{:,.0f}", "이전 목표가": sy + "{:,.0f}"}, na_rep="-"),
                     hide_index=True, width="stretch", height=min(600, 38 * len(acts) + 40))
         st.caption("데이터: Yahoo Finance 증권사 레이팅·목표가. 코멘트는 레이팅 변경을 요약한 것으로, 증권사 리포트 원문이 아닙니다.")
+
+# ═════════════════════════════════════════════
+# 4-1) 종합 추천 (거장 + 평단 + 기술 + 애널리스트)
+# ═════════════════════════════════════════════
+with tab_rec:
+    st.caption("거장 중복 보유 · 거장 추정 평단 대비 위치 · 기술적 지표 · 증권사 의견을 각각 0~10점으로 매기고 "
+               "가중 합산해 **100점 만점**으로 평가합니다. ⚠️ 매수 권유가 아닌 참고용 스크리닝입니다.")
+    with st.expander("⚖️ 항목별 비중 조절", expanded=False):
+        wc = st.columns(4)
+        W = {k: wc[i].slider(R.COMPONENTS[k], 0, 50, R.DEFAULT_W[k], step=5, key=f"w_{k}")
+             for i, k in enumerate(R.COMPONENTS)}
+        cc = st.columns(3)
+        use_cost = cc[0].toggle("거장 평단 반영 (처음 1~2분 소요)", value=True, key="rec_cost")
+        min_holders = cc[1].slider("후보: 최소 보유 거장 수 (0 = 애널리스트 종목 포함)", 0, 4, 0, key="rec_minh")
+        n_top = cc[2].slider("표시 개수", 5, 30, 15, key="rec_n")
+    if not use_cost:
+        W["cost"] = 0
+
+    # ── 후보 종목: 거장 보유 종목(티커 변환된 것) + 애널리스트 핵심 종목 + 관심 종목
+    store = _figi_store()
+    ovr = G.overlap(ok) if ok else pd.DataFrame()
+    t2row = {}
+    if not ovr.empty:
+        tickers_for(ovr.head(40)["cusip"].tolist())
+        for _, rr in ovr.iterrows():
+            t = store.get(rr["cusip"])
+            if t and t not in t2row:
+                t2row[t] = rr
+    cands = [t for t, rr in t2row.items() if rr["holders"] >= max(1, min_holders)][:40]
+    if min_holders == 0:
+        cands += list(AN.UNIVERSE_CORE)
+    if ta_ticker:
+        cands.append(ta_ticker)
+    cands = tuple(dict.fromkeys(cands))
+
+    if not cands:
+        st.info("후보 종목이 없습니다. 거장 탭에서 거장을 선택하거나 '최소 보유 거장 수'를 0으로 두세요.")
+    else:
+        with st.spinner(f"후보 {len(cands)}종목 분석 중… (증권사 의견·주가)"):
+            a_raw = analyst_bulk(cands)
+            px_data = load_prices(cands, "2y")
+        a_sum = {t: AN.summarize(t, *a_raw[t], days=90) for t in cands if t in a_raw}
+
+        # 거장 평단 (후보를 보유한 거장만)
+        prem_map: dict[str, list[float]] = {}
+        if use_cost and ok:
+            cusip_of = {v: k for k, v in store.items() if v}
+            prog = st.progress(0.0, text="거장 추정 평단 계산 중…")
+            for i, (g, r_) in enumerate(ok.items(), 1):
+                hh = r_["holdings"]
+                held = [(c, store.get(c)) for c in hh[hh["shares"] > 0]["cusip"] if store.get(c) in cands]
+                if held:
+                    for c, est in guru_costs(g, held).items():
+                        t = store.get(c)
+                        if est["avg_cost"] and pd.notna(est["price"]):
+                            prem_map.setdefault(t, []).append((est["price"] / est["avg_cost"] - 1) * 100)
+                prog.progress(i / len(ok), text=f"거장 추정 평단 계산 중… {g}")
+            prog.empty()
+
+        rows = []
+        for t in cands:
+            gr = t2row.get(t)
+            ts, why = R.tech_score(px_data.get(t))
+            sm = a_sum.get(t)
+            prem = float(np.median(prem_map[t])) if prem_map.get(t) else np.nan
+            sc = {"guru": R.guru_score(gr), "cost": R.cost_score(prem) if use_cost else np.nan,
+                  "tech": ts, "analyst": R.analyst_score(sm)}
+            total = R.combine(sc, W)
+            rows.append({
+                "ticker": t, "total": total, **sc,
+                "holders": int(gr["holders"]) if gr is not None else 0,
+                "buyers": int(gr["buyers"]) if gr is not None else 0,
+                "gurus_short": ", ".join(x.split("(")[0] for x in str(gr["gurus"]).split(", ")[:3]) if gr is not None else "",
+                "prem": prem, "trend": why.get("추세", ""), "rsi": why.get("RSI", np.nan), "macd": why.get("MACD", "-"),
+                "sup_dist": why.get("지지선까지", np.nan),
+                "bull_firms": sm["bull_firms"] if sm else np.nan, "bear_firms": sm["bear_firms"] if sm else np.nan,
+                "upside": sm["upside"] if sm else np.nan,
+            })
+        rec = pd.DataFrame(rows).dropna(subset=["total"]).sort_values("total", ascending=False).reset_index(drop=True)
+        rec["grade"] = rec["total"].map(R.grade)
+        top = rec.head(n_top)
+
+        # 누적 막대 (항목별 기여도)
+        wsum = {k: v for k, v in W.items() if v > 0}
+        s_ = top.iloc[::-1]
+        fig = go.Figure()
+        colors = {"guru": "#7e57c2", "cost": "#ffb300", "tech": "#26a69a", "analyst": "#42a5f5"}
+        for k in R.COMPONENTS:
+            if W[k] <= 0:
+                continue
+            contrib = []
+            for _, rr in s_.iterrows():
+                avail = {kk: w for kk, w in wsum.items() if pd.notna(rr[kk])}
+                den = sum(avail.values()) or 1
+                contrib.append(rr[k] * W[k] / den * 10 if pd.notna(rr[k]) else 0)
+            fig.add_trace(go.Bar(x=contrib, y=s_["ticker"], orientation="h", name=R.COMPONENTS[k],
+                                 marker_color=colors[k], hovertemplate="%{y} " + R.COMPONENTS[k] + " %{x:.1f}점<extra></extra>"))
+        fig.add_trace(go.Scatter(x=s_["total"] + 4, y=s_["ticker"], mode="text", showlegend=False,
+                                 text=[f"<b>{v:.0f}</b>" for v in s_["total"]]))
+        fig.update_layout(barmode="stack", title="종합 매수 후보 점수 (100점 만점, 색 = 항목별 기여)",
+                          height=max(420, 30 * len(s_) + 100), xaxis=dict(range=[0, 108]),
+                          legend=dict(orientation="h", y=-0.08), margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+        st.markdown("##### 🏆 TOP 5 — 선정 이유 <small>(자동 요약)</small>", unsafe_allow_html=True)
+        cols5 = st.columns(min(5, len(top)) or 1)
+        for col_, (_, rr) in zip(cols5, top.head(5).iterrows()):
+            with col_:
+                with st.container(border=True):
+                    st.markdown(f"### {rr['ticker']}")
+                    st.markdown(f"**{rr['total']:.0f}점** · {rr['grade']}")
+                    st.caption(" · ".join(f"{R.COMPONENTS[k].split()[1]} {rr[k]:.1f}" for k in R.COMPONENTS if pd.notna(rr[k])))
+                    for line in R.reason(rr.to_dict(), sym_of(rr["ticker"])):
+                        st.markdown(f"<small>{line}</small>", unsafe_allow_html=True)
+        if api_key and len(top):
+            with st.container(border=True):
+                with st.spinner("AI 해설 작성 중…"):
+                    st.markdown("**🤖 AI 해설**  \n" + (ai_cached(R.ai_prompt(top.head(10), W), api_key, ai_model) or ""))
+
+        st.markdown("##### 📋 전체 점수표")
+        st.dataframe(pd.DataFrame({
+            "티커": top["ticker"], "종합": top["total"], "평가": top["grade"],
+            "거장": top["guru"], "평단": top["cost"], "기술": top["tech"], "애널": top["analyst"],
+            "보유 거장": top["holders"], "거장 평단 대비": top["prem"], "추세": top["trend"], "RSI": top["rsi"],
+            "매수의견 증권사": top["bull_firms"], "상승여력": top["upside"],
+        }), hide_index=True, width="stretch", column_config={
+            "종합": st.column_config.ProgressColumn("종합 (/100)", min_value=0, max_value=100, format="%.0f"),
+            "거장": st.column_config.NumberColumn(format="%.1f"), "평단": st.column_config.NumberColumn(format="%.1f"),
+            "기술": st.column_config.NumberColumn(format="%.1f"), "애널": st.column_config.NumberColumn(format="%.1f"),
+            "거장 평단 대비": st.column_config.NumberColumn(format="%+.0f%%"),
+            "RSI": st.column_config.NumberColumn(format="%.0f"),
+            "매수의견 증권사": st.column_config.NumberColumn(format="%d"),
+            "상승여력": st.column_config.NumberColumn(format="%+.0f%%")})
+        with st.expander("ℹ️ 점수 계산 방법"):
+            st.markdown(
+                "- **🏛️ 거장 (0~10)**: 보유 거장 수(4명 이상 6점) + 이번 분기 매수 거장(3명 이상 3점) + 신규 매수 1점 − 매도 거장(최대 1.5점)\n"
+                "- **💰 거장 평단 (0~10)**: 현재가가 보유 거장들 추정 평단(중앙값) 이하면 10점, +150% 이상이면 0점 (선형)\n"
+                "- **📈 기술적 (0~10)**: 종가>50일선 2 · 50일선>200일선 2 · 종가>200일선 1 · RSI 40~65 2점(과열·과매도는 감점) · "
+                "MACD 상승 1.5 · 지지선 5% 이내 1.5\n"
+                "- **📑 애널리스트 (0~10)**: 애널리스트 탭 강세 점수/10 − 약세 점수/20 (최근 90일)\n"
+                "- 데이터가 없는 항목은 빼고 나머지 비중으로 다시 계산합니다. 75점↑ 강력 매수 후보 · 60↑ 매수 후보 · 45↑ 관망.")
 
 # ═════════════════════════════════════════════
 # 5) 재무 비교 (동종업계 대비 10점 만점)
