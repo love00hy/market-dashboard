@@ -273,7 +273,7 @@ with st.sidebar:
     st.caption("데이터는 10분간 캐시됩니다.")
     st.divider()
     st.subheader("🪙 내 관심 종목")
-    ta_ticker = st.text_input("티커 (예: COIN, NVDA, 005930.KS, BTC-USD)", value="",
+    ta_ticker = st.text_input("티커 (예: COIN, NVDA, 005930.KS, BTC-USD)", value="", key="ta_ticker_in",
                               placeholder="티커를 입력하세요").strip().upper()
     st.markdown("**💼 내 포지션** (차트에 평단선 표시)")
     pc1, pc2 = st.columns(2)
@@ -292,6 +292,153 @@ with st.sidebar:
     st.caption("⚠️ 투자 참고용입니다. 투자 판단과 책임은 본인에게 있습니다.")
 
 SYM = sym_of(ta_ticker)
+
+# ─────────────────────────────────────────────
+# 종목 미리보기 패널 (거장 탭의 표에서 종목 줄을 클릭하면 오른쪽에 회사·증권사 의견·차트)
+# ─────────────────────────────────────────────
+REC_KO = {"strong_buy": "강력 매수", "buy": "매수", "hold": "보유", "underperform": "시장 하회",
+          "sell": "매도", "strong_sell": "강력 매도", "none": "-"}
+st.markdown("""<style>
+@media (min-width: 900px) { [class*="st-key-peekbox"] { position: sticky; top: 3.5rem; } }
+</style>""", unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def peek_info(t: str) -> dict:
+    try:
+        info = yf.Ticker(t).info or {}
+    except Exception:
+        info = {}
+    keys = ["longName", "shortName", "sector", "industry", "country", "website", "marketCap", "currency",
+            "currentPrice", "regularMarketPrice", "previousClose", "longBusinessSummary", "fullTimeEmployees",
+            "trailingPE", "forwardPE", "recommendationKey", "recommendationMean", "numberOfAnalystOpinions",
+            "targetMeanPrice", "targetHighPrice", "targetLowPrice", "fiftyTwoWeekHigh", "fiftyTwoWeekLow"]
+    return {k: info.get(k) for k in keys}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def peek_summary_ko(t: str, text: str, n: int = 4) -> str:
+    import re as _re
+    if not text:
+        return ""
+    short = " ".join(_re.split(r"(?<=[.!?])\s+", text.strip())[:n])
+    ko = N.translate_ko([short])
+    return ko[0] if ko else short
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def peek_actions(t: str) -> pd.DataFrame:
+    try:
+        ud = yf.Ticker(t).upgrades_downgrades
+    except Exception:
+        ud = None
+    return AN.tidy_actions(ud).head(6)
+
+
+def _peek_cb(key: str):
+    sel = st.session_state.get(key)
+    try:
+        rows = sel["selection"]["rows"]
+    except Exception:
+        rows = []
+    tks = st.session_state.get(key + "_tk", [])
+    if rows and rows[0] < len(tks):
+        st.session_state["peek"] = tks[rows[0]] or f"?{rows[0]}"
+
+
+def pick_table(data, tickers: list, key: str, **kw):
+    """종목 줄을 클릭하면 오른쪽 미리보기 패널에 그 종목이 나오는 표."""
+    st.session_state[key + "_tk"] = [t if isinstance(t, str) and t else None for t in tickers]
+    st.dataframe(data, on_select=lambda k=key: _peek_cb(k), selection_mode="single-row", key=key, **kw)
+
+
+def _peek_to_ta(t: str):
+    st.session_state["ta_ticker_in"] = t
+
+
+def render_peek(where: str, options: list[str]):
+    with st.container(border=True, key=f"peekbox_{where}"):
+        st.markdown("#### 🔍 종목 미리보기")
+        opts = [""] + sorted({o for o in options if o})
+        def _sel():
+            v = st.session_state.get(f"peek_sel_{where}")
+            if v:
+                st.session_state["peek"] = v
+        st.selectbox("종목 고르기 (또는 왼쪽 표에서 줄 클릭)", opts, key=f"peek_sel_{where}", on_change=_sel)
+        t = st.session_state.get("peek")
+        if not t:
+            st.caption("👈 표에서 종목 줄을 클릭하면 여기에 회사 소개 · 증권사 의견 · 차트가 나옵니다.")
+            return
+        if t.startswith("?"):
+            st.info("이 종목은 티커를 찾지 못해 미리보기를 할 수 없습니다 (해외 상장·비상장 등).")
+            return
+        with st.spinner(f"{t} 불러오는 중…"):
+            info = peek_info(t)
+            px = load_prices((t,), "1y").get(t)
+        name = info.get("longName") or info.get("shortName") or t
+        st.markdown(f"**{t} · {name}**")
+        meta = " · ".join(x for x in [info.get("sector"), info.get("industry"), info.get("country")] if x)
+        if meta:
+            st.caption(meta)
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if price is None and px is not None and len(px):
+            price = float(px["Close"].iloc[-1])
+        prev = info.get("previousClose")
+        m1, m2 = st.columns(2)
+        m1.metric("현재가", f"${price:,.2f}" if price else "-",
+                  f"{(price / prev - 1) * 100:+.2f}%" if price and prev else None)
+        m2.metric("시가총액", fmt_money(info["marketCap"]).lstrip("+") if info.get("marketCap") else "-")
+
+        st.markdown("**🏢 어떤 회사?**")
+        summ = info.get("longBusinessSummary") or ""
+        if summ:
+            st.write(peek_summary_ko(t, summ))
+            with st.expander("영문 원문 전체"):
+                st.write(summ)
+        else:
+            st.caption("회사 소개 정보가 없습니다.")
+
+        st.markdown("**📑 증권사 의견**")
+        rk, n_op = info.get("recommendationKey"), info.get("numberOfAnalystOpinions")
+        tgt, hi, lo = info.get("targetMeanPrice"), info.get("targetHighPrice"), info.get("targetLowPrice")
+        if rk or tgt:
+            a1, a2 = st.columns(2)
+            a1.metric("컨센서스", REC_KO.get(str(rk), str(rk or "-")),
+                      f"{n_op}명 · 평균 {info['recommendationMean']:.1f}점" if n_op and info.get("recommendationMean") else None,
+                      delta_color="off", help="평균 점수: 1 = 강력 매수 … 5 = 강력 매도")
+            a2.metric("평균 목표가", f"${tgt:,.2f}" if tgt else "-",
+                      f"{(tgt / price - 1) * 100:+.1f}% 여력" if tgt and price else None)
+            if hi and lo:
+                st.caption(f"목표가 범위 ${lo:,.2f} ~ ${hi:,.2f}")
+        acts = peek_actions(t)
+        if len(acts):
+            st.dataframe(pd.DataFrame({
+                "날짜": acts["date"].dt.strftime("%y.%m.%d"), "증권사": acts["firm"],
+                "의견": [AN.ko_grade(g) for g in acts["to"]],
+                "변화": [AN.KO_ACTION.get(str(a).strip().lower(), str(a)) for a in acts["action"]],
+                "목표가": acts["pt"]}).style.format({"목표가": "${:,.0f}"}, na_rep="-"),
+                hide_index=True, width="stretch")
+        elif not (rk or tgt):
+            st.caption("증권사 의견 정보가 없습니다.")
+
+        if px is not None and len(px):
+            d = px.tail(126)
+            fig = go.Figure(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+                                           increasing_line_color=UP, decreasing_line_color=DOWN, name=t))
+            for n_ma, col in ((20, "#ffa726"), (60, "#42a5f5")):
+                ma = px["Close"].rolling(n_ma).mean().tail(126)
+                fig.add_trace(go.Scatter(x=ma.index, y=ma, mode="lines", line=dict(width=1.2, color=col), name=f"{n_ma}일선"))
+            if tgt:
+                fig.add_hline(y=tgt, line_dash="dot", line_color="#7e57c2",
+                              annotation_text=f"목표가 ${tgt:,.0f}", annotation_position="top left")
+            fig.update_layout(title="최근 6개월", height=300, showlegend=False, xaxis_rangeslider_visible=False,
+                              margin=dict(l=10, r=10, t=40, b=10))
+            show_chart(fig)
+        st.button(f"🪙 {t} 기술적 분석 탭에서 자세히", on_click=_peek_to_ta, args=(t,), width="stretch",
+                  key=f"peek_ta_{where}")
+        st.caption("Yahoo Finance 기준 · 회사 소개는 자동 번역")
+
+
 
 st.title("📈 마켓 대시보드")
 st.caption(f"Yahoo Finance 기준 (약 15분 지연) · 조회 시각 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -484,203 +631,213 @@ def label_of(cusip: str, name: str, tk: dict) -> str:
 
 
 with tab_guru:
-    sel_gurus = st.multiselect("👤 거장·기관 선택", list(G.GURUS), default=G.DEFAULT_GURUS,
-                               format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
-    st.caption("출처: SEC EDGAR 13F-HR 공시 (분기 말 기준, 분기 종료 후 최대 45일 뒤 공개) · 미국 상장 주식 롱 포지션만 포함, "
-               "공매도·현금·해외주식·옵션 제외")
-    guru_res: dict[str, dict] = {}
-    if sel_gurus:
-        prog = st.progress(0.0, text="SEC 공시 불러오는 중…")
-        for i, g in enumerate(sel_gurus, 1):
-            guru_res[g] = guru_data(G.GURUS[g][0], SEC_UA)
-            prog.progress(i / len(sel_gurus), text=f"SEC 공시 불러오는 중… {g}")
-        prog.empty()
-    ok = {g: r for g, r in guru_res.items() if "holdings" in r}
-    for g, r in guru_res.items():
-        if "error" in r:
-            st.warning(f"{g}: 공시를 불러오지 못했습니다 ({r['error']})")
+    guru_main, guru_side = st.columns([7, 3], gap="medium")
+    with guru_main:
+        sel_gurus = st.multiselect("👤 거장·기관 선택", list(G.GURUS), default=G.DEFAULT_GURUS,
+                                   format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
+        st.caption("출처: SEC EDGAR 13F-HR 공시 (분기 말 기준, 분기 종료 후 최대 45일 뒤 공개) · 미국 상장 주식 롱 포지션만 포함, "
+                   "공매도·현금·해외주식·옵션 제외")
+        guru_res: dict[str, dict] = {}
+        if sel_gurus:
+            prog = st.progress(0.0, text="SEC 공시 불러오는 중…")
+            for i, g in enumerate(sel_gurus, 1):
+                guru_res[g] = guru_data(G.GURUS[g][0], SEC_UA)
+                prog.progress(i / len(sel_gurus), text=f"SEC 공시 불러오는 중… {g}")
+            prog.empty()
+        ok = {g: r for g, r in guru_res.items() if "holdings" in r}
+        for g, r in guru_res.items():
+            if "error" in r:
+                st.warning(f"{g}: 공시를 불러오지 못했습니다 ({r['error']})")
 
-    need = []
-    for r in ok.values():
-        h = r["holdings"]
-        need += h.head(25)["cusip"].tolist() + h[h["status"] == "청산"].head(5)["cusip"].tolist()
-    with st.spinner("종목 티커 변환 중…"):
-        TK = tickers_for(need) if need else {}
-
-    if ok:
-        ov_rows = []
-        for g, r in ok.items():
+        need = []
+        for r in ok.values():
             h = r["holdings"]
-            ov_rows.append({"거장": g, "운용사": G.GURUS[g][1], "기준 분기": r["period"], "공시일": r["filed"],
-                            "평가액": r["total"], "전분기 대비": r["value_chg"], "종목 수": int((h["shares"] > 0).sum()),
-                            "신규": int((h["status"] == "신규").sum()), "증가": int((h["status"] == "증가").sum()),
-                            "감소": int((h["status"] == "감소").sum()), "청산": int((h["status"] == "청산").sum()),
-                            "최대 보유": label_of(h.iloc[0]["cusip"], h.iloc[0]["name"], TK) if len(h) else "-"})
-        ovdf = pd.DataFrame(ov_rows)
-        c1, c2 = st.columns([2, 3])
-        with c1:
-            s = ovdf.sort_values("전분기 대비")
-            fig = go.Figure(go.Bar(x=s["전분기 대비"], y=s["거장"], orientation="h",
-                                   marker_color=[UP if v >= 0 else DOWN for v in s["전분기 대비"].fillna(0)],
-                                   text=[f"{v:+.1f}%" for v in s["전분기 대비"]], textposition="outside"))
-            fig.update_layout(title="포트폴리오 평가액 증감률 (전분기 대비)", height=380, xaxis_ticksuffix="%",
-                              margin=dict(l=10, r=40, t=50, b=10))
-            show_chart(fig)
-        with c2:
-            st.markdown("##### 한눈에 보기")
-            st.dataframe(ovdf.drop(columns=["운용사"]).style.format(
-                {"평가액": lambda v: fmt_money(v).lstrip("+"), "전분기 대비": "{:+.1f}%"}, na_rep="-"),
-                hide_index=True, width="stretch", height=380)
+            need += h.head(25)["cusip"].tolist() + h[h["status"] == "청산"].head(5)["cusip"].tolist()
+        with st.spinner("종목 티커 변환 중…"):
+            TK = tickers_for(need) if need else {}
 
-        st.markdown("---")
-        pick = st.selectbox("🔎 자세히 볼 거장", list(ok), format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
-        r = ok[pick]
-        h = r["holdings"].copy()
-        h["종목"] = [label_of(c, n, TK) for c, n in zip(h["cusip"], h["name"])]
-        m = st.columns(5)
-        m[0].metric("기준 분기", r["period"], f"공시 {r['filed']}", delta_color="off")
-        m[1].metric("13F 평가액", fmt_money(r["total"]).lstrip("+"), f"{r['value_chg']:+.1f}% (전분기)")
-        m[2].metric("보유 종목", f"{int((h['shares'] > 0).sum())}개")
-        m[3].metric("상위 5종목 비중", f"{h[h['shares'] > 0].head(5)['weight'].sum():.0f}%")
-        m[4].metric("신규 / 청산", f"{int((h['status'] == '신규').sum())} / {int((h['status'] == '청산').sum())}")
+        if ok:
+            ov_rows = []
+            for g, r in ok.items():
+                h = r["holdings"]
+                ov_rows.append({"거장": g, "운용사": G.GURUS[g][1], "기준 분기": r["period"], "공시일": r["filed"],
+                                "평가액": r["total"], "전분기 대비": r["value_chg"], "종목 수": int((h["shares"] > 0).sum()),
+                                "신규": int((h["status"] == "신규").sum()), "증가": int((h["status"] == "증가").sum()),
+                                "감소": int((h["status"] == "감소").sum()), "청산": int((h["status"] == "청산").sum()),
+                                "최대 보유": label_of(h.iloc[0]["cusip"], h.iloc[0]["name"], TK) if len(h) else "-"})
+            ovdf = pd.DataFrame(ov_rows)
+            c1, c2 = st.columns([2, 3])
+            with c1:
+                s = ovdf.sort_values("전분기 대비")
+                fig = go.Figure(go.Bar(x=s["전분기 대비"], y=s["거장"], orientation="h",
+                                       marker_color=[UP if v >= 0 else DOWN for v in s["전분기 대비"].fillna(0)],
+                                       text=[f"{v:+.1f}%" for v in s["전분기 대비"]], textposition="outside"))
+                fig.update_layout(title="포트폴리오 평가액 증감률 (전분기 대비)", height=380, xaxis_ticksuffix="%",
+                                  margin=dict(l=10, r=40, t=50, b=10))
+                show_chart(fig)
+            with c2:
+                st.markdown("##### 한눈에 보기")
+                st.dataframe(ovdf.drop(columns=["운용사"]).style.format(
+                    {"평가액": lambda v: fmt_money(v).lstrip("+"), "전분기 대비": "{:+.1f}%"}, na_rep="-"),
+                    hide_index=True, width="stretch", height=380)
 
-        with st.container(border=True):
-            st.markdown(f"**💬 {pick} 이번 분기 코멘트** <small>(공시 데이터 기반 자동 요약 · 본인 발언 아님)</small>",
+            st.markdown("---")
+            pick = st.selectbox("🔎 자세히 볼 거장", list(ok), format_func=lambda g: f"{g} ({G.GURUS[g][1]})")
+            r = ok[pick]
+            h = r["holdings"].copy()
+            h["종목"] = [label_of(c, n, TK) for c, n in zip(h["cusip"], h["name"])]
+            m = st.columns(5)
+            m[0].metric("기준 분기", r["period"], f"공시 {r['filed']}", delta_color="off")
+            m[1].metric("13F 평가액", fmt_money(r["total"]).lstrip("+"), f"{r['value_chg']:+.1f}% (전분기)")
+            m[2].metric("보유 종목", f"{int((h['shares'] > 0).sum())}개")
+            m[3].metric("상위 5종목 비중", f"{h[h['shares'] > 0].head(5)['weight'].sum():.0f}%")
+            m[4].metric("신규 / 청산", f"{int((h['status'] == '신규').sum())} / {int((h['status'] == '청산').sum())}")
+
+            with st.container(border=True):
+                st.markdown(f"**💬 {pick} 이번 분기 코멘트** <small>(공시 데이터 기반 자동 요약 · 본인 발언 아님)</small>",
+                            unsafe_allow_html=True)
+                for line in G.guru_comment(r, TK):
+                    st.markdown(f"- {line}")
+                if api_key:
+                    with st.spinner("AI 해설 작성 중…"):
+                        st.markdown("**🤖 AI 해설**  \n" + (ai_cached(G.guru_ai_prompt(pick, r, TK), api_key, ai_model) or ""))
+
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                top = h[h["shares"] > 0].head(15).iloc[::-1]
+                fig = go.Figure(go.Bar(
+                    x=top["weight"], y=top["종목"], orientation="h",
+                    marker_color=[STATUS_COLOR[s] for s in top["status"]],
+                    text=[f"{w:.1f}% · {STATUS_ICON[s]}" + (f" {c:+.0f}%" if s in ("증가", "감소") else "")
+                          for w, s, c in zip(top["weight"], top["status"], top["share_chg"])],
+                    textposition="outside"))
+                fig.update_layout(title=f"{pick} 상위 15 보유종목 (비중 %, 색 = 이번 분기 매매)", height=560,
+                                  xaxis=dict(ticksuffix="%", range=[0, top["weight"].max() * 1.45 if len(top) else 1]),
+                                  margin=dict(l=10, r=10, t=50, b=10))
+                show_chart(fig)
+            with c2:
+                buys = h[h["status"].isin(["신규", "증가"])].sort_values("weight", ascending=False).head(8)
+                sells = h[h["status"].isin(["감소", "청산"])].sort_values("weight_prev", ascending=False).head(8)
+                st.markdown("##### 🟢 이번 분기 매수")
+                pick_table(pd.DataFrame({"종목": buys["종목"], "구분": buys["status"].map(STATUS_ICON),
+                                         "주식수 변화": buys["share_chg"], "현재 비중": buys["weight"]})
+                           .style.format({"주식수 변화": "{:+.0f}%", "현재 비중": "{:.2f}%"}, na_rep="신규"),
+                           [TK.get(c) for c in buys["cusip"]], "pk_buys", hide_index=True, width="stretch")
+                st.markdown("##### 🔴 이번 분기 매도")
+                pick_table(pd.DataFrame({"종목": sells["종목"], "구분": sells["status"].map(STATUS_ICON),
+                                         "주식수 변화": sells["share_chg"], "직전 비중": sells["weight_prev"]})
+                           .style.format({"주식수 변화": "{:+.0f}%", "직전 비중": "{:.2f}%"}, na_rep="-"),
+                           [TK.get(c) for c in sells["cusip"]], "pk_sells", hide_index=True, width="stretch")
+
+            st.markdown(f"##### 📌 {pick} 추정 평단가 <small>(최근 4년 13F 기반 추정 · 실제 매입가 아님)</small>",
                         unsafe_allow_html=True)
-            for line in G.guru_comment(r, TK):
-                st.markdown(f"- {line}")
-            if api_key:
-                with st.spinner("AI 해설 작성 중…"):
-                    st.markdown("**🤖 AI 해설**  \n" + (ai_cached(G.guru_ai_prompt(pick, r, TK), api_key, ai_model) or ""))
+            top_ct = [(c, TK.get(c)) for c in h[h["shares"] > 0].head(12)["cusip"]]
+            with st.spinner("과거 공시로 평단 추정 중… (처음 한 번 10~20초)"):
+                costs = guru_costs(pick, top_ct)
+            if costs:
+                crow, crow_tk = [], []
+                for c, t in top_ct:
+                    e = costs.get(c)
+                    if not e:
+                        continue
+                    hr = h[h["cusip"] == c].iloc[0]
+                    ret = (e["price"] / e["avg_cost"] - 1) * 100 if pd.notna(e["price"]) and e["avg_cost"] else np.nan
+                    crow.append({"종목": hr["종목"], "비중": hr["weight"],
+                                 "보유 시작": ("≤ " if e["start_in_window"] else "") + str(e["first_period"] or "-"),
+                                 "추정 평단": ("≤ " if e["start_in_window"] else "") + (f"${e['avg_cost']:,.2f}" if t else "-"),
+                                 "현재가": e["price"], "추정 수익률": ret})
+                    crow_tk.append(t)
+                pick_table(pd.DataFrame(crow).style.format({"비중": "{:.1f}%", "현재가": "${:,.2f}",
+                                                            "추정 수익률": "{:+.1f}%"}, na_rep="-"),
+                           crow_tk, "pk_cost", hide_index=True, width="stretch")
+                st.caption("방법: 분기마다 늘어난 주식 수를 그 분기 평균 종가에 샀다고 보고 가중평균(평균단가법, 액면분할 반영). "
+                           "'≤' 표시는 조회 기간(4년) 이전부터 보유 → 실제 평단은 이보다 낮을 가능성이 큽니다. "
+                           "기술적 분석 탭 차트에도 선으로 표시됩니다.")
+            else:
+                st.info("평단을 추정할 과거 공시를 불러오지 못했습니다.")
 
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            top = h[h["shares"] > 0].head(15).iloc[::-1]
-            fig = go.Figure(go.Bar(
-                x=top["weight"], y=top["종목"], orientation="h",
-                marker_color=[STATUS_COLOR[s] for s in top["status"]],
-                text=[f"{w:.1f}% · {STATUS_ICON[s]}" + (f" {c:+.0f}%" if s in ("증가", "감소") else "")
-                      for w, s, c in zip(top["weight"], top["status"], top["share_chg"])],
-                textposition="outside"))
-            fig.update_layout(title=f"{pick} 상위 15 보유종목 (비중 %, 색 = 이번 분기 매매)", height=560,
-                              xaxis=dict(ticksuffix="%", range=[0, top["weight"].max() * 1.45 if len(top) else 1]),
-                              margin=dict(l=10, r=10, t=50, b=10))
-            show_chart(fig)
-        with c2:
-            buys = h[h["status"].isin(["신규", "증가"])].sort_values("weight", ascending=False).head(8)
-            sells = h[h["status"].isin(["감소", "청산"])].sort_values("weight_prev", ascending=False).head(8)
-            st.markdown("##### 🟢 이번 분기 매수")
-            st.dataframe(pd.DataFrame({"종목": buys["종목"], "구분": buys["status"].map(STATUS_ICON),
-                                       "주식수 변화": buys["share_chg"], "현재 비중": buys["weight"]})
-                         .style.format({"주식수 변화": "{:+.0f}%", "현재 비중": "{:.2f}%"}, na_rep="신규"),
-                         hide_index=True, width="stretch")
-            st.markdown("##### 🔴 이번 분기 매도")
-            st.dataframe(pd.DataFrame({"종목": sells["종목"], "구분": sells["status"].map(STATUS_ICON),
-                                       "주식수 변화": sells["share_chg"], "직전 비중": sells["weight_prev"]})
-                         .style.format({"주식수 변화": "{:+.0f}%", "직전 비중": "{:.2f}%"}, na_rep="-"),
-                         hide_index=True, width="stretch")
-
-        st.markdown(f"##### 📌 {pick} 추정 평단가 <small>(최근 4년 13F 기반 추정 · 실제 매입가 아님)</small>",
-                    unsafe_allow_html=True)
-        top_ct = [(c, TK.get(c)) for c in h[h["shares"] > 0].head(12)["cusip"]]
-        with st.spinner("과거 공시로 평단 추정 중… (처음 한 번 10~20초)"):
-            costs = guru_costs(pick, top_ct)
-        if costs:
-            crow = []
-            for c, t in top_ct:
-                e = costs.get(c)
-                if not e:
-                    continue
-                hr = h[h["cusip"] == c].iloc[0]
-                ret = (e["price"] / e["avg_cost"] - 1) * 100 if pd.notna(e["price"]) and e["avg_cost"] else np.nan
-                crow.append({"종목": hr["종목"], "비중": hr["weight"],
-                             "보유 시작": ("≤ " if e["start_in_window"] else "") + str(e["first_period"] or "-"),
-                             "추정 평단": ("≤ " if e["start_in_window"] else "") + (f"${e['avg_cost']:,.2f}" if t else "-"),
-                             "현재가": e["price"], "추정 수익률": ret})
-            st.dataframe(pd.DataFrame(crow).style.format({"비중": "{:.1f}%", "현재가": "${:,.2f}",
-                                                          "추정 수익률": "{:+.1f}%"}, na_rep="-"),
-                         hide_index=True, width="stretch")
-            st.caption("방법: 분기마다 늘어난 주식 수를 그 분기 평균 종가에 샀다고 보고 가중평균(평균단가법, 액면분할 반영). "
-                       "'≤' 표시는 조회 기간(4년) 이전부터 보유 → 실제 평단은 이보다 낮을 가능성이 큽니다. "
-                       "기술적 분석 탭 차트에도 선으로 표시됩니다.")
-        else:
-            st.info("평단을 추정할 과거 공시를 불러오지 못했습니다.")
-
-        with st.expander(f"📋 {pick} 전체 보유내역 ({len(h)}줄)"):
-            full = pd.DataFrame({"종목": h["종목"], "상태": h["status"].map(STATUS_ICON), "비중": h["weight"],
-                                 "직전 비중": h["weight_prev"], "평가액": h["value"], "주식수": h["shares"],
-                                 "주식수 변화": h["share_chg"], "CUSIP": h["cusip"]})
-            st.dataframe(full.style.format({"비중": "{:.2f}%", "직전 비중": "{:.2f}%",
-                                            "평가액": lambda v: fmt_money(v).lstrip("+"),
-                                            "주식수": "{:,.0f}", "주식수 변화": "{:+.1f}%"}, na_rep="-"),
-                         hide_index=True, width="stretch")
-            st.caption("티커는 OpenFIGI로 CUSIP을 변환한 것이며, 변환 안 된 종목은 회사명으로 표시됩니다.")
-    elif sel_gurus:
-        st.error("선택한 거장의 공시를 하나도 불러오지 못했습니다. 잠시 후 '데이터 새로고침'을 눌러 주세요.")
+            with st.expander(f"📋 {pick} 전체 보유내역 ({len(h)}줄)"):
+                full = pd.DataFrame({"종목": h["종목"], "상태": h["status"].map(STATUS_ICON), "비중": h["weight"],
+                                     "직전 비중": h["weight_prev"], "평가액": h["value"], "주식수": h["shares"],
+                                     "주식수 변화": h["share_chg"], "CUSIP": h["cusip"]})
+                pick_table(full.style.format({"비중": "{:.2f}%", "직전 비중": "{:.2f}%",
+                                              "평가액": lambda v: fmt_money(v).lstrip("+"),
+                                              "주식수": "{:,.0f}", "주식수 변화": "{:+.1f}%"}, na_rep="-"),
+                           [TK.get(c) for c in h["cusip"]], "pk_full", hide_index=True, width="stretch")
+                st.caption("티커는 OpenFIGI로 CUSIP을 변환한 것이며, 변환 안 된 종목은 회사명으로 표시됩니다.")
+        elif sel_gurus:
+            st.error("선택한 거장의 공시를 하나도 불러오지 못했습니다. 잠시 후 '데이터 새로고침'을 눌러 주세요.")
+    with guru_side:
+        render_peek("guru", [TK.get(c) for r_ in ok.values() for c in r_["holdings"]["cusip"].head(40)] if ok else [])
 
 # ═════════════════════════════════════════════
 # 3) 거장 중복 종목
 # ═════════════════════════════════════════════
 with tab_overlap:
-    ov = G.overlap(ok) if ok else pd.DataFrame()
-    if ov.empty:
-        st.info("‘거장 포트폴리오’ 탭에서 거장을 2명 이상 선택해 주세요.")
-    else:
-        TK = tickers_for(ov.head(60)["cusip"].tolist())
-        ov["티커"] = ov["cusip"].map(TK)
-        ov["종목"] = [label_of(c, n, TK) for c, n in zip(ov["cusip"], ov["name"])]
-        cc = st.columns([2, 2, 3])
-        min_h = cc[0].slider("최소 보유 거장 수", 1, max(2, len(ok)), min(2, len(ok)))
-        top_k = cc[1].slider("표시 개수", 10, 50, 20, step=5)
-        cc[2].caption(f"선택한 거장 {len(ok)}명 기준 · 점수 = 보유 거장 수×10 + 이번 분기 매수 거장×5 + 신규 매수×3 "
-                      "− 매도 거장×4 + 평균 비중×0.5")
-        view = ov[ov["holders"] >= min_h].head(top_k)
+    ov_main, ov_side = st.columns([7, 3], gap="medium")
+    with ov_main:
+        ov = G.overlap(ok) if ok else pd.DataFrame()
+        if ov.empty:
+            st.info("‘거장 포트폴리오’ 탭에서 거장을 2명 이상 선택해 주세요.")
+        else:
+            TK = tickers_for(ov.head(60)["cusip"].tolist())
+            ov["티커"] = ov["cusip"].map(TK)
+            ov["종목"] = [label_of(c, n, TK) for c, n in zip(ov["cusip"], ov["name"])]
+            cc = st.columns([2, 2, 3])
+            min_h = cc[0].slider("최소 보유 거장 수", 1, max(2, len(ok)), min(2, len(ok)))
+            top_k = cc[1].slider("표시 개수", 10, 50, 20, step=5)
+            cc[2].caption(f"선택한 거장 {len(ok)}명 기준 · 점수 = 보유 거장 수×10 + 이번 분기 매수 거장×5 + 신규 매수×3 "
+                          "− 매도 거장×4 + 평균 비중×0.5")
+            view = ov[ov["holders"] >= min_h].head(top_k)
 
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            s = view.iloc[::-1]
-            fig = go.Figure(go.Bar(
-                x=s["score"], y=s["종목"], orientation="h",
-                marker=dict(color=s["holders"], colorscale="Tealgrn", showscale=True,
-                            colorbar=dict(title="보유<br>거장 수")),
-                text=[f"{int(hh)}명 보유 · 매수 {int(b)} / 매도 {int(sl)}" for hh, b, sl in
-                      zip(s["holders"], s["buyers"], s["sellers"])],
-                textposition="outside", customdata=s["gurus"],
-                hovertemplate="%{y}<br>점수 %{x}<br>%{customdata}<extra></extra>"))
-            fig.update_layout(title="거장 중복 보유 종목 점수", height=max(420, 26 * len(s) + 80),
-                              xaxis=dict(range=[0, s["score"].max() * 1.5 if len(s) else 1]),
-                              margin=dict(l=10, r=10, t=50, b=10))
-            show_chart(fig)
-        with c2:
-            with st.container(border=True):
-                st.markdown("**💬 중복 종목 코멘트** <small>(자동 요약)</small>", unsafe_allow_html=True)
-                for _, rr in view.head(6).iterrows():
-                    trend = ("이번 분기 **매수세**" if rr["buyers"] > rr["sellers"] else
-                             "이번 분기 **매도세**" if rr["sellers"] > rr["buyers"] else "보유 유지")
-                    st.markdown(f"- **{rr['종목']}** — 거장 {int(rr['holders'])}명 보유, {trend} "
-                                f"(매수 {int(rr['buyers'])} · 매도 {int(rr['sellers'])}, 평균 비중 {rr['avg_weight']:.1f}%)")
-                if api_key and len(view):
-                    body = "\n".join(f"- {x['종목']}: 보유 {int(x['holders'])}명 [{x['gurus']}], 매수 {int(x['buyers'])}, "
-                                     f"매도 {int(x['sellers'])}" for _, x in view.head(12).iterrows())
-                    prompt = ("너는 한국 개인투자자를 돕는 애널리스트다. 아래는 유명 투자자들의 13F 공시에서 여러 명이 "
-                              f"동시에 보유한 종목 목록이다.\n\n{body}\n\n이 데이터만 근거로 한국어 3~4문장으로: 거장들이 "
-                              "공통으로 선호하는 테마/섹터, 이번 분기 매수가 몰린 종목, 주의할 점(13F는 45일 지연된 과거 데이터). "
-                              "투자자들의 발언을 지어내지 마라.")
-                    with st.spinner("AI 해설 작성 중…"):
-                        st.markdown("**🤖 AI 해설**  \n" + (ai_cached(prompt, api_key, ai_model) or ""))
-            newbuys = ov[ov["new"] >= 1].sort_values(["new", "holders"], ascending=False).head(10)
-            st.markdown("##### 🆕 이번 분기 새로 산 종목 (신규 매수 거장 수 순)")
-            st.dataframe(pd.DataFrame({"종목": newbuys["종목"], "신규 매수": newbuys["new"].astype(int),
-                                       "보유 거장": newbuys["holders"].astype(int)}),
-                         hide_index=True, width="stretch")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                s = view.iloc[::-1]
+                fig = go.Figure(go.Bar(
+                    x=s["score"], y=s["종목"], orientation="h",
+                    marker=dict(color=s["holders"], colorscale="Tealgrn", showscale=True,
+                                colorbar=dict(title="보유<br>거장 수")),
+                    text=[f"{int(hh)}명 보유 · 매수 {int(b)} / 매도 {int(sl)}" for hh, b, sl in
+                          zip(s["holders"], s["buyers"], s["sellers"])],
+                    textposition="outside", customdata=s["gurus"],
+                    hovertemplate="%{y}<br>점수 %{x}<br>%{customdata}<extra></extra>"))
+                fig.update_layout(title="거장 중복 보유 종목 점수", height=max(420, 26 * len(s) + 80),
+                                  xaxis=dict(range=[0, s["score"].max() * 1.5 if len(s) else 1]),
+                                  margin=dict(l=10, r=10, t=50, b=10))
+                show_chart(fig)
+            with c2:
+                with st.container(border=True):
+                    st.markdown("**💬 중복 종목 코멘트** <small>(자동 요약)</small>", unsafe_allow_html=True)
+                    for _, rr in view.head(6).iterrows():
+                        trend = ("이번 분기 **매수세**" if rr["buyers"] > rr["sellers"] else
+                                 "이번 분기 **매도세**" if rr["sellers"] > rr["buyers"] else "보유 유지")
+                        st.markdown(f"- **{rr['종목']}** — 거장 {int(rr['holders'])}명 보유, {trend} "
+                                    f"(매수 {int(rr['buyers'])} · 매도 {int(rr['sellers'])}, 평균 비중 {rr['avg_weight']:.1f}%)")
+                    if api_key and len(view):
+                        body = "\n".join(f"- {x['종목']}: 보유 {int(x['holders'])}명 [{x['gurus']}], 매수 {int(x['buyers'])}, "
+                                         f"매도 {int(x['sellers'])}" for _, x in view.head(12).iterrows())
+                        prompt = ("너는 한국 개인투자자를 돕는 애널리스트다. 아래는 유명 투자자들의 13F 공시에서 여러 명이 "
+                                  f"동시에 보유한 종목 목록이다.\n\n{body}\n\n이 데이터만 근거로 한국어 3~4문장으로: 거장들이 "
+                                  "공통으로 선호하는 테마/섹터, 이번 분기 매수가 몰린 종목, 주의할 점(13F는 45일 지연된 과거 데이터). "
+                                  "투자자들의 발언을 지어내지 마라.")
+                        with st.spinner("AI 해설 작성 중…"):
+                            st.markdown("**🤖 AI 해설**  \n" + (ai_cached(prompt, api_key, ai_model) or ""))
+                newbuys = ov[ov["new"] >= 1].sort_values(["new", "holders"], ascending=False).head(10)
+                st.markdown("##### 🆕 이번 분기 새로 산 종목 (신규 매수 거장 수 순)")
+                pick_table(pd.DataFrame({"종목": newbuys["종목"], "신규 매수": newbuys["new"].astype(int),
+                                         "보유 거장": newbuys["holders"].astype(int)}),
+                           newbuys["티커"].tolist(), "pk_newbuys", hide_index=True, width="stretch")
 
-        st.markdown("##### 📋 중복 보유 종목 표")
-        st.dataframe(pd.DataFrame({
-            "종목": view["종목"], "점수": view["score"], "보유 거장 수": view["holders"].astype(int),
-            "보유 거장 (비중)": view["gurus"], "이번 분기 매수": view["buyers"].astype(int),
-            "신규": view["new"].astype(int), "매도": view["sellers"].astype(int), "평균 비중": view["avg_weight"],
-        }).style.format({"점수": "{:.1f}", "평균 비중": "{:.2f}%"}), hide_index=True, width="stretch")
-        st.caption("👈 관심 가는 종목은 사이드바 '내 관심 종목'에 티커를 넣으면 기술적 분석 탭에서 바로 볼 수 있어요.")
+            st.markdown("##### 📋 중복 보유 종목 표")
+            pick_table(pd.DataFrame({
+                "종목": view["종목"], "점수": view["score"], "보유 거장 수": view["holders"].astype(int),
+                "보유 거장 (비중)": view["gurus"], "이번 분기 매수": view["buyers"].astype(int),
+                "신규": view["new"].astype(int), "매도": view["sellers"].astype(int), "평균 비중": view["avg_weight"],
+            }).style.format({"점수": "{:.1f}", "평균 비중": "{:.2f}%"}), view["티커"].tolist(), "pk_overlap",
+                hide_index=True, width="stretch")
+            st.caption("👉 표에서 종목 줄을 클릭하면 오른쪽에 회사 소개 · 증권사 의견 · 차트가 나옵니다.")
+    with ov_side:
+        render_peek("ov", ov["티커"].dropna().tolist() if len(ov) and "티커" in ov else [])
 
 # ═════════════════════════════════════════════
 # 4) 애널리스트 강세·약세
